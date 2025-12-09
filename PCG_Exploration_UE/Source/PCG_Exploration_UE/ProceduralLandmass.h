@@ -1,39 +1,32 @@
-//-----------------------------------------------------------------------------
-// ProceduralLandmass.h
-//
-// Runtime-generated terrain with height- and slope-based biome coloring.
-//-----------------------------------------------------------------------------
-
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "ProceduralMeshComponent.h"
 #include "ProceduralLandmass.generated.h"
 
-class UProceduralMeshComponent;
-class UMaterialInterface;
-
-// Represents one "biome" or terrain layer
+// Simple biome / terrain type definition
 USTRUCT(BlueprintType)
 struct FTerrainType
 {
-    GENERATED_BODY();
+    GENERATED_BODY()
 
-    UPROPERTY(EditAnywhere, Category = "Terrain")
-    FName Name = "Biome";
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain")
+    FName Name = NAME_None;
 
-    // Height threshold in [0,1]. If vertexHeight <= Height, this biome is eligible.
-    UPROPERTY(EditAnywhere, Category = "Terrain", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    // Normalized height [0..1] at which this biome starts
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float Height = 0.0f;
 
-    // Slope range this biome applies to (0 = flat, 1 = vertical)
-    UPROPERTY(EditAnywhere, Category = "Terrain", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    // Slope limits in degrees
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.0", ClampMax = "90.0"))
     float MinSlope = 0.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float MaxSlope = 1.0f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain", meta = (ClampMin = "0.0", ClampMax = "90.0"))
+    float MaxSlope = 90.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain")
+    // Debug color for this biome (vertex color in terrain material)
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain")
     FLinearColor Color = FLinearColor::White;
 };
 
@@ -45,76 +38,76 @@ class PCG_EXPLORATION_UE_API AProceduralLandmass : public AActor
 public:
     AProceduralLandmass();
 
-protected:
-    virtual void BeginPlay() override;
-
+    // Called when properties change in editor (eg. you tweak sliders)
 #if WITH_EDITOR
-    virtual void OnConstruction(const FTransform& Transform) override;
     virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
 #endif
 
-    // Terrain mesh
+protected:
+    virtual void BeginPlay() override;
+
+public:
+    // Called every frame (we don’t really need this right now, but it’s fine)
+    virtual void Tick(float DeltaTime) override;
+
+    // ---- Public settings exposed to Details panel ----
+
     UPROPERTY(VisibleAnywhere, Category = "Terrain")
     UProceduralMeshComponent* ProceduralMesh;
 
-public:
-    // =========================
-    //   Noise / shape settings
-    // =========================
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "2"))
+    // Map dimensions in number of grid cells
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "2", UIMin = "2"))
     int32 MapWidth = 100;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "2"))
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "2", UIMin = "2"))
     int32 MapHeight = 100;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "1.0"))
+    // World size of each grid cell
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "1.0", UIMin = "1.0"))
     float GridSize = 100.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "0.001"))
+    // Height multiplier (world units)
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise")
+    float HeightMultiplier = 300.0f;
+
+    // Perlin noise parameters
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "0.001", UIMin = "0.001"))
     float NoiseScale = 50.0f;
 
     UPROPERTY(EditAnywhere, Category = "Terrain|Noise")
     int32 Seed = 1337;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "1"))
-    int32 Octaves = 5;
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "1", UIMin = "1"))
+    int32 Octaves = 4;
 
     UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float Persistance = 0.5f;
+    float Persistence = 0.5f;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "1.0"))
+    UPROPERTY(EditAnywhere, Category = "Terrain|Noise", meta = (ClampMin = "0.01"))
     float Lacunarity = 2.0f;
 
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise")
-    FVector2D NoiseOffset = FVector2D::ZeroVector;
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Noise")
-    float HeightMultiplier = 300.0f;
-
-    // =========================
-    //   Biome / color settings
-    // =========================
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Biomes")
-    UMaterialInterface* TerrainMaterial = nullptr;
-
+    // Biome list used by the terrain material (vertex colors)
     UPROPERTY(EditAnywhere, Category = "Terrain|Biomes")
     TArray<FTerrainType> TerrainTypes;
 
-    // How much neighboring biomes overlap in height for blending
-    UPROPERTY(EditAnywhere, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", ClampMax = "0.5"))
-    float HeightBlendRange = 0.03f;
+    // How soft the vertical blending is between biomes (normalized height range)
+    UPROPERTY(EditAnywhere, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float HeightBlendRange = 0.02f;
 
-    // =========================
-    //   Editor utility
-    // =========================
-
+    // Exposed button in Details panel
     UFUNCTION(CallInEditor, Category = "Terrain")
     void GenerateTerrain();
 
+    // Gives external systems (like water) a normalized “sea level”
+    UFUNCTION(BlueprintCallable, Category = "Terrain")
+    float GetDefaultWaterHeight01() const;
+
+    // Convenience for water: returns center location of the landmass
+    UFUNCTION(BlueprintCallable, Category = "Terrain")
+    FVector GetLandmassCenter() const;
+
 private:
-    void GenerateNoiseMap(TArray<float>& OutHeightMap);
-    void CreateMeshFromHeightMap(const TArray<float>& HeightMap);
-    FLinearColor GetColorForHeightAndSlope(float NormalizedHeight, float Slope) const;
+    void CreateMesh();
+    void BuildHeightMap(TArray<float>& OutHeights) const;
+    float SampleNoise2D(float X, float Y) const;
 };
