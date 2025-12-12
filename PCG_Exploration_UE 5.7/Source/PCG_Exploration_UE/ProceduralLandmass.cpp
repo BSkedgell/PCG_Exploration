@@ -3,7 +3,8 @@
 #include "ProceduralLandmass.h"
 
 #include "ProceduralMeshComponent.h"
-#include "Materials/MaterialInstanceDynamic.h"   // <-- needed for UMaterialInstanceDynamic
+#include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "ProceduralWaterPlane.h"
@@ -22,6 +23,9 @@ AProceduralLandmass::AProceduralLandmass()
 void AProceduralLandmass::BeginPlay()
 {
     Super::BeginPlay();
+
+    // Make sure our MID exists and is synced at runtime
+    EnsureTerrainMaterialInstance();
 }
 
 void AProceduralLandmass::Tick(float DeltaTime)
@@ -38,6 +42,7 @@ void AProceduralLandmass::PostEditChangeProperty(FPropertyChangedEvent& Property
         ? PropertyChangedEvent.Property->GetFName()
         : NAME_None;
 
+    // Geometry / noise changes -> rebuild mesh + refresh material
     if (PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, MapWidth) ||
         PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, MapHeight) ||
         PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, GridSize) ||
@@ -46,14 +51,18 @@ void AProceduralLandmass::PostEditChangeProperty(FPropertyChangedEvent& Property
         PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, Seed) ||
         PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, Octaves) ||
         PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, Persistence) ||
-        PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, Lacunarity) ||
-        PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, WaterHeight01))  // <-- add this
+        PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, Lacunarity))
     {
         GenerateTerrain();
     }
-    // If the water height changed, also tell any linked water planes to realign.
+
+    // Water height changes -> just update material + move any linked water planes
     if (PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, WaterHeight01))
     {
+        // Keep terrain material parameter in sync
+        EnsureTerrainMaterialInstance();
+
+        // Tell any water planes linked to THIS landmass to realign
         if (UWorld* World = GetWorld())
         {
             for (TActorIterator<AProceduralWaterPlane> It(World); It; ++It)
@@ -61,7 +70,6 @@ void AProceduralLandmass::PostEditChangeProperty(FPropertyChangedEvent& Property
                 AProceduralWaterPlane* Water = *It;
                 if (Water && Water->LinkedLandmass == this)
                 {
-                    // Re-run its construction logic so it snaps to the new height
                     Water->RefreshFromLandmass();
                 }
             }
@@ -73,6 +81,39 @@ void AProceduralLandmass::PostEditChangeProperty(FPropertyChangedEvent& Property
 void AProceduralLandmass::GenerateTerrain()
 {
     CreateMesh();
+    EnsureTerrainMaterialInstance();
+}
+
+void AProceduralLandmass::EnsureTerrainMaterialInstance()
+{
+    if (!ProceduralMesh)
+    {
+        return;
+    }
+
+    // Create the MID once
+    if (!TerrainMID)
+    {
+        // Prefer the explicitly assigned base material; otherwise use whatever is on Element 0
+        UMaterialInterface* BaseMat = BaseTerrainMaterial ? BaseTerrainMaterial
+            : ProceduralMesh->GetMaterial(0);
+
+        if (!BaseMat)
+        {
+            return;
+        }
+
+        TerrainMID = UMaterialInstanceDynamic::Create(BaseMat, this);
+        ProceduralMesh->SetMaterial(0, TerrainMID);
+    }
+
+    // Keep scalar parameters in sync
+    if (TerrainMID)
+    {
+        TerrainMID->SetScalarParameterValue(TEXT("WaterHeight"), WaterHeight01);
+        // Later: TerrainMID->SetScalarParameterValue(TEXT("SandHeight"), SandHeight01);
+        // etc.
+    }
 }
 
 float AProceduralLandmass::GetDefaultWaterHeight01() const
@@ -136,10 +177,10 @@ void AProceduralLandmass::CreateMesh()
 
             // Height-only in B channel (0..1), R/G free for future use
             VertexColors[Index] = FLinearColor(
-                0.0f,       // R - reserved (e.g., biome)
-                0.0f,       // G - reserved (e.g., slope)
-                Height01,   // B - normalized height
-                1.0f        // A - wetness/whatever later
+                0.0f,      // R - reserved (biome)
+                0.0f,      // G - reserved (slope)
+                Height01,  // B - normalized height
+                1.0f       // A - wetness/whatever later
             );
 
             // Simple tangent along +X
@@ -228,27 +269,6 @@ void AProceduralLandmass::CreateMesh()
         Tangents,
         true  // bCreateCollision
     );
-
-    // --- Set up / update dynamic material instance so the material
-    //     WaterHeight parameter matches WaterHeight01 on this actor ---
-    if (!TerrainMID)
-    {
-        // Use whatever material is assigned in the editor as the base
-        UMaterialInterface* BaseMat = ProceduralMesh->GetMaterial(0);
-        if (BaseMat)
-        {
-            TerrainMID = UMaterialInstanceDynamic::Create(BaseMat, this);
-        }
-    }
-
-    if (TerrainMID)
-    {
-        TerrainMID->SetScalarParameterValue(TEXT("WaterHeight"), WaterHeight01);
-
-        // (Optional) drive other scalar params (SandHeight, GrassHeight, etc.) here
-
-        ProceduralMesh->SetMaterial(0, TerrainMID);
-    }
 }
 
 void AProceduralLandmass::BuildHeightMap(TArray<float>& OutHeights) const

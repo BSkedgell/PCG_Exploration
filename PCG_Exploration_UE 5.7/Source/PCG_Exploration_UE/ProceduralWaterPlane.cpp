@@ -92,11 +92,11 @@ void AProceduralWaterPlane::BuildWaterPlane()
         return;
     }
 
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FVector2D> UVs;
-    TArray<FLinearColor> Colors;
+    TArray<FVector>        Vertices;
+    TArray<int32>          Triangles;
+    TArray<FVector>        Normals;
+    TArray<FVector2D>      UVs;
+    TArray<FLinearColor>   Colors;
     TArray<FProcMeshTangent> Tangents;
 
     Vertices.SetNum(4);
@@ -126,7 +126,20 @@ void AProceduralWaterPlane::BuildWaterPlane()
         Tangents[i] = FProcMeshTangent(1.0f, 0.0f, 0.0f);
     }
 
-    Triangles = { 0, 1, 2, 2, 1, 3 };
+    // --- Flip the triangle winding so the front face points UP (+Z) ---
+    Triangles.Reset();
+    // First tri: 0,2,1  (counter-clockwise when viewed from above)
+    Triangles.Add(0);
+    Triangles.Add(2);
+    Triangles.Add(1);
+
+    // Second tri: 2,3,1
+    Triangles.Add(2);
+    Triangles.Add(3);
+    Triangles.Add(1);
+
+    // Optional: clear old section before recreating
+    Mesh->ClearMeshSection(0);
 
     Mesh->CreateMeshSection_LinearColor(
         0,
