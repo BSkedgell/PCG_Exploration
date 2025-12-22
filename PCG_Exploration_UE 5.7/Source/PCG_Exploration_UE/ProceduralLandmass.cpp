@@ -285,6 +285,15 @@ void AProceduralLandmass::BuildHeightMap(TArray<float>& OutHeights) const
         return;
     }
 
+    // --- NEW: compute world-aligned base coordinates for this tile ---
+    // Convert the actor's world location into "grid steps"
+    const float InvGridSize = (GridSize > 0.0f) ? (1.0f / GridSize) : 0.0f;
+    const FVector ActorLoc = GetActorLocation();
+
+    const float BaseWorldX = ActorLoc.X * InvGridSize;
+    const float BaseWorldY = ActorLoc.Y * InvGridSize;
+    // ---------------------------------------------------------------
+
     FRandomStream Rng(Seed);
     const FVector2D Offset(
         Rng.FRandRange(-10000.f, 10000.f),
@@ -297,8 +306,13 @@ void AProceduralLandmass::BuildHeightMap(TArray<float>& OutHeights) const
         {
             const int32 Index = y * MapWidth + x;
 
-            const float SampleX = (static_cast<float>(x) + Offset.X) / NoiseScale;
-            const float SampleY = (static_cast<float>(y) + Offset.Y) / NoiseScale;
+            // --- NEW: world-aligned grid coordinates for this vertex ---
+            const float WorldGridX = BaseWorldX + static_cast<float>(x);
+            const float WorldGridY = BaseWorldY + static_cast<float>(y);
+
+            const float SampleX = (WorldGridX + Offset.X) / NoiseScale;
+            const float SampleY = (WorldGridY + Offset.Y) / NoiseScale;
+            // -----------------------------------------------------------
 
             float NoiseHeight = 0.0f;
             float Amplitude = 1.0f;

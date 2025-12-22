@@ -62,6 +62,9 @@ public:
     UPROPERTY(EditAnywhere, Category = "Terrain|Heights", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float WaterHeight01 = 0.22f;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain")
+    FVector2D TileOffset = FVector2D(0, 0);
+
     // ------------ Material ------------
     // Base material asset you assign in the editor (e.g. M_ProceduralTerrain)
     UPROPERTY(EditAnywhere, Category = "Terrain|Material")
