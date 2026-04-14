@@ -7,9 +7,6 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/KismetSystemLibrary.h"
-#include "ProceduralWaterPlane.h"
-#include "EngineUtils.h" // for TActorIterator
-
 AProceduralLandmass::AProceduralLandmass()
 {
     PrimaryActorTick.bCanEverTick = false;
@@ -56,24 +53,10 @@ void AProceduralLandmass::PostEditChangeProperty(FPropertyChangedEvent& Property
         GenerateTerrain();
     }
 
-    // Water height changes -> just update material + move any linked water planes
+    // Water height changes -> keep the terrain material parameter in sync
     if (PropName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, WaterHeight01))
     {
-        // Keep terrain material parameter in sync
         EnsureTerrainMaterialInstance();
-
-        // Tell any water planes linked to THIS landmass to realign
-        if (UWorld* World = GetWorld())
-        {
-            for (TActorIterator<AProceduralWaterPlane> It(World); It; ++It)
-            {
-                AProceduralWaterPlane* Water = *It;
-                if (Water && Water->LinkedLandmass == this)
-                {
-                    Water->RefreshFromLandmass();
-                }
-            }
-        }
     }
 }
 #endif // WITH_EDITOR
@@ -186,7 +169,7 @@ void AProceduralLandmass::CreateMesh()
             // Simple tangent along +X
             Tangents[Index] = FProcMeshTangent(1.0f, 0.0f, 0.0f);
 
-            // Initialize normals to zero; we’ll accumulate face normals then normalize
+            // Initialize normals to zero; we'll accumulate face normals then normalize
             Normals[Index] = FVector::ZeroVector;
         }
     }
