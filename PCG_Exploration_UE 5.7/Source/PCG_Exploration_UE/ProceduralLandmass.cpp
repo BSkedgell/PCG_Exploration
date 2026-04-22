@@ -403,6 +403,67 @@ FVector AProceduralLandmass::GetLandmassCenter() const
     return GetActorLocation() + FVector(WidthWorld * 0.5f, HeightWorld * 0.5f, 0.0f);
 }
 
+float AProceduralLandmass::GetDefaultWaterSurfaceZ() const
+{
+    const FVector LocalWaterPoint(0.0f, 0.0f, WaterHeight01 * HeightMultiplier);
+    return GetActorTransform().TransformPosition(LocalWaterPoint).Z;
+}
+
+float AProceduralLandmass::GetTerrainHeightAtWorldLocation(const FVector& WorldLocation) const
+{
+    const FVector LocalLocation = GetActorTransform().InverseTransformPosition(WorldLocation);
+
+    float Height01 = 0.0f;
+    if (!SampleHeight01AtLocalXY(LocalLocation.X, LocalLocation.Y, Height01))
+    {
+        return GetActorLocation().Z;
+    }
+
+    const FVector LocalTerrainPoint(LocalLocation.X, LocalLocation.Y, Height01 * HeightMultiplier);
+    return GetActorTransform().TransformPosition(LocalTerrainPoint).Z;
+}
+
+bool AProceduralLandmass::SampleHeight01AtLocalXY(float LocalX, float LocalY, float& OutHeight01) const
+{
+    OutHeight01 = 0.0f;
+
+    if (GridSize <= KINDA_SMALL_NUMBER || MapWidth < 2 || MapHeight < 2)
+    {
+        return false;
+    }
+
+    if (CachedHeightMap.Num() != MapWidth * MapHeight)
+    {
+        return false;
+    }
+
+    const float GridX = LocalX / GridSize;
+    const float GridY = LocalY / GridSize;
+
+    if (GridX < 0.0f || GridY < 0.0f || GridX > static_cast<float>(MapWidth - 1) || GridY > static_cast<float>(MapHeight - 1))
+    {
+        return false;
+    }
+
+    const int32 X0 = FMath::Clamp(FMath::FloorToInt(GridX), 0, MapWidth - 1);
+    const int32 Y0 = FMath::Clamp(FMath::FloorToInt(GridY), 0, MapHeight - 1);
+    const int32 X1 = FMath::Min(X0 + 1, MapWidth - 1);
+    const int32 Y1 = FMath::Min(Y0 + 1, MapHeight - 1);
+
+    const float Tx = GridX - static_cast<float>(X0);
+    const float Ty = GridY - static_cast<float>(Y0);
+
+    const float H00 = CachedHeightMap[Y0 * MapWidth + X0];
+    const float H10 = CachedHeightMap[Y0 * MapWidth + X1];
+    const float H01 = CachedHeightMap[Y1 * MapWidth + X0];
+    const float H11 = CachedHeightMap[Y1 * MapWidth + X1];
+
+    const float Bottom = FMath::Lerp(H00, H10, Tx);
+    const float Top = FMath::Lerp(H01, H11, Tx);
+    OutHeight01 = FMath::Clamp(FMath::Lerp(Bottom, Top, Ty), 0.0f, 1.0f);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Generation Pipeline
 // ---------------------------------------------------------------------------
@@ -495,6 +556,7 @@ void AProceduralLandmass::CreateMesh()
     // are both derived from this same source of truth.
     TArray<float> Heights;
     BuildHeightMap(Heights);
+    CachedHeightMap = Heights;
 
     // Build vertices, UVs, vertex colors, and tangents.
     for (int32 y = 0; y < NumVertsY; ++y)

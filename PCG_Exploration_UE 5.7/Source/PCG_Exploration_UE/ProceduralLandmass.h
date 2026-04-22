@@ -26,6 +26,12 @@ public:
     float   GetDefaultWaterHeight01() const;
     FVector GetLandmassCenter() const;
 
+    UFUNCTION(BlueprintPure, Category = "Terrain|Queries")
+    float GetDefaultWaterSurfaceZ() const;
+
+    UFUNCTION(BlueprintPure, Category = "Terrain|Queries")
+    float GetTerrainHeightAtWorldLocation(const FVector& WorldLocation) const;
+
     // Components
     // ProceduralMesh is the heightfield terrain. OverhangMesh is separate geometry
     // because true overhangs cannot be represented by a one-height-per-XY heightmap.
@@ -251,9 +257,14 @@ private:
     void EnsureTerrainMaterialInstance();
     bool IsGenerationProperty(FName PropertyName) const;
     bool IsMaterialProperty(FName PropertyName) const;
+    bool SampleHeight01AtLocalXY(float LocalX, float LocalY, float& OutHeight01) const;
 
     // Dynamic material instance for the terrain. Never expose directly; assign
     // BaseTerrainMaterial instead.
     UPROPERTY(Transient)
     UMaterialInstanceDynamic* TerrainMID = nullptr;
+
+    // Cached normalized heightfield used by water/shoreline biome queries.
+    UPROPERTY(Transient)
+    TArray<float> CachedHeightMap;
 };
