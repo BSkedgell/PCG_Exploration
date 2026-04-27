@@ -336,6 +336,10 @@ bool AProceduralLandmass::IsGenerationProperty(FName PropertyName) const
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CoastFalloff) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CoastEdgeHardness) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CoastNoiseInfluence) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, bEnableEdgeSubmerge) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, EdgeSubmergeWidth) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, EdgeSubmergeDepth) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, EdgeSubmergeHardness) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, BeachFlattenStrength) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, BeachWidthScale) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, BeachNoiseReduction) ||
@@ -1392,6 +1396,12 @@ void AProceduralLandmass::BuildHeightMap(TArray<float>& OutHeights) const
             const float RadialDistance = FMath::Sqrt(CenteredX * CenteredX + CenteredY * CenteredY);
             const float Falloff = FMath::Clamp((RadialDistance - CoastFalloff) / FMath::Max(1.0f - CoastFalloff, 0.001f), 0.0f, 1.0f);
             const float CoastMask = 1.0f - FMath::Pow(Falloff, CoastEdgeHardness);
+            const float EdgeDistance01 = FMath::Min3(
+                (MapWidth > 1) ? static_cast<float>(x) / static_cast<float>(MapWidth - 1) : 0.0f,
+                (MapHeight > 1) ? static_cast<float>(y) / static_cast<float>(MapHeight - 1) : 0.0f,
+                FMath::Min(
+                    (MapWidth > 1) ? static_cast<float>(MapWidth - 1 - x) / static_cast<float>(MapWidth - 1) : 0.0f,
+                    (MapHeight > 1) ? static_cast<float>(MapHeight - 1 - y) / static_cast<float>(MapHeight - 1) : 0.0f));
 
             // Domain warping keeps the Perlin layers from looking too grid-like.
             const float WarpNoiseX = FMath::PerlinNoise2D(FVector2D((WorldGridX + Offset.X) / 140.0f, (WorldGridY + Offset.Y) / 140.0f));
@@ -1702,6 +1712,27 @@ void AProceduralLandmass::BuildHeightMap(TArray<float>& OutHeights) const
                     FinalHeight,
                     WearTarget,
                     MountainWearMask * MountainWearStrength);
+                FinalHeight = FMath::Clamp(FinalHeight, 0.0f, 1.0f);
+            }
+
+            // Hard rectangular boundary rule: whatever the higher-level
+            // landform systems produce, the generated mesh edges fade below
+            // water so islands are not visibly sliced by MapWidth/MapHeight.
+            if (bEnableEdgeSubmerge && EdgeSubmergeWidth > KINDA_SMALL_NUMBER)
+            {
+                const float Inland01 = FMath::Clamp(
+                    EdgeDistance01 / FMath::Max(EdgeSubmergeWidth, 0.001f),
+                    0.0f,
+                    1.0f);
+                const float InlandBlend = FMath::Pow(
+                    FMath::SmoothStep(0.0f, 1.0f, Inland01),
+                    FMath::Max(EdgeSubmergeHardness, 0.1f));
+                const float UnderwaterEdgeHeight = FMath::Clamp(
+                    WaterHeight01 - EdgeSubmergeDepth,
+                    0.0f,
+                    1.0f);
+
+                FinalHeight = FMath::Lerp(UnderwaterEdgeHeight, FinalHeight, InlandBlend);
                 FinalHeight = FMath::Clamp(FinalHeight, 0.0f, 1.0f);
             }
 

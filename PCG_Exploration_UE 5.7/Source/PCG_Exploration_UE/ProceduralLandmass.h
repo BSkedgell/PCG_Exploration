@@ -94,6 +94,20 @@ public:
     UPROPERTY(EditAnywhere, Category = "Terrain|Coast & Beaches", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float CoastNoiseInfluence = 0.35f;
 
+    // Forces the rectangular generated mesh boundary below water so landforms
+    // never appear sliced off by MapWidth/MapHeight.
+    UPROPERTY(EditAnywhere, Category = "Terrain|Coast & Beaches")
+    bool bEnableEdgeSubmerge = true;
+
+    UPROPERTY(EditAnywhere, Category = "Terrain|Coast & Beaches", meta = (ClampMin = "0.01", ClampMax = "0.5"))
+    float EdgeSubmergeWidth = 0.12f;
+
+    UPROPERTY(EditAnywhere, Category = "Terrain|Coast & Beaches", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+    float EdgeSubmergeDepth = 0.08f;
+
+    UPROPERTY(EditAnywhere, Category = "Terrain|Coast & Beaches", meta = (ClampMin = "0.1", ClampMax = "8.0"))
+    float EdgeSubmergeHardness = 1.8f;
+
     UPROPERTY(EditAnywhere, Category = "Terrain|Coast & Beaches", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float BeachFlattenStrength = 0.72f;
 
