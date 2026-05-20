@@ -15,10 +15,14 @@ UENUM(BlueprintType)
 enum class EProceduralWaterBiome : uint8
 {
     DryLand UMETA(DisplayName = "Dry Land"),
-    WetShore UMETA(DisplayName = "Wet Shore"),
-    ShallowWater UMETA(DisplayName = "Shallow Water"),
-    LittoralShelf UMETA(DisplayName = "Littoral Shelf"),
-    DeepWater UMETA(DisplayName = "Deep Water")
+    LakeWetShore UMETA(DisplayName = "Lake Wet Shore"),
+    LakeShallowWater UMETA(DisplayName = "Lake Shallow Water"),
+    LakeLittoralShelf UMETA(DisplayName = "Lake Littoral Shelf"),
+    LakeDeepWater UMETA(DisplayName = "Lake Deep Water"),
+    OceanWetShore UMETA(DisplayName = "Ocean Wet Shore"),
+    OceanShallowWater UMETA(DisplayName = "Ocean Shallow Water"),
+    OceanLittoralShelf UMETA(DisplayName = "Ocean Littoral Shelf"),
+    OceanDeepWater UMETA(DisplayName = "Ocean Deep Water")
 };
 
 UENUM(BlueprintType)
@@ -59,6 +63,9 @@ public:
     // surface. This intentionally avoids a hard dependency on the Water module.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|References")
     AActor* WaterBodyLakeActor = nullptr;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|References")
+    TArray<AActor*> AdditionalWaterBodyLakeActors;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|References")
     AActor* WaterBodyOceanActor = nullptr;
@@ -110,6 +117,15 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Spline Fitting", meta = (ClampMin = "0.0"), AdvancedDisplay)
     float OceanLakeBlendOverlapDistance = 600.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Spline Fitting")
+    bool bAutoCreateAdditionalLakeActors = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Spline Fitting", meta = (ClampMin = "4"), AdvancedDisplay)
+    int32 MinimumAdditionalLakeRegionCells = 8;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Spline Fitting", meta = (ClampMin = "1", ClampMax = "16"), AdvancedDisplay)
+    int32 MaxAutoLakeActors = 6;
 
     // Internal helper; the main editor workflow should use FitAllWaterToLandmass.
     void FitLakeSplineToLandmass();
@@ -243,6 +259,15 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Thresholds", meta = (ClampMin = "1.0"), AdvancedDisplay)
     float LittoralShelfDepth = 650.0f;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Thresholds", meta = (ClampMin = "1.0"))
+    float OceanWetShoreDistance = 350.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Thresholds", meta = (ClampMin = "1.0"))
+    float OceanShallowWaterDistance = 1800.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Thresholds", meta = (ClampMin = "1.0"))
+    float OceanLittoralShelfDistance = 5200.0f;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Water Biome|Debug")
     bool bDrawDebugBiomeGrid = true;
 
@@ -293,6 +318,8 @@ public:
 
 private:
     bool FitLakeSplineToInlandBasin();
+    AActor* GetOrCreateAdditionalLakeActor(int32 AdditionalLakeIndex, const FVector& SpawnLocation);
+    bool IsLakeWaterActor(const AActor* WaterActor) const;
     bool FitOceanSplineToOuterCoastline(float OceanExtentPadding);
     bool FitWaterActorSplineToLandmass(AActor* WaterActor, float Padding);
     bool FitOceanToLakeSpline(float OceanExtentPadding);
@@ -314,13 +341,19 @@ private:
     int32 GetWaterActorFitSplinePointCount(AActor* WaterActor) const;
     EWaterSplineFitShape GetWaterActorFitShape(AActor* WaterActor) const;
     USplineComponent* FindEditableWaterSpline(AActor* WaterActor) const;
+    void InvalidateWaterQueryCache() const;
+    void RebuildLakeSplineQueryCache() const;
     void DrawDebugBiomeGrid() const;
+    bool IsInsideLandmassXY(const FVector& WorldLocation) const;
+    bool IsWaterAtWorldLocation(const FVector& WorldLocation) const;
     bool IsInsideDebugWaterBounds(const FVector& WorldLocation) const;
+    bool IsInsideWaterBodyActorBounds(const AActor* WaterActor, const FVector& WorldLocation) const;
     bool IsInsideAnyWaterSpline(const FVector& WorldLocation, bool& bFoundSpline) const;
     float GetDistanceToNearestLakeSplineEdge(const FVector& WorldLocation, bool& bFoundSpline, bool& bInsideLake) const;
     float GetDistanceToNearestShoreline(const FVector& WorldLocation) const;
     float GetWaveExposureAtWorldLocation(const FVector& WorldLocation) const;
     float GetDirectionalWaveFetchAtWorldLocation(const FVector& WorldLocation) const;
+    float GetFastWaveEnergyAtWorldLocation(const FVector& WorldLocation) const;
     FColor GetDebugColorForBiome(EProceduralWaterBiome Biome) const;
     FColor GetDebugColorForWaveEnergy(float WaveEnergy) const;
 
@@ -332,4 +365,11 @@ private:
 
     UPROPERTY(Transient)
     mutable TObjectPtr<UTexture2D> SeaStateTexture = nullptr;
+
+    mutable bool bSeaStateTextureDirty = true;
+    mutable TWeakObjectPtr<const USplineComponent> CachedLakeSplineComponent;
+    mutable TArray<FVector2D> CachedLakeSplinePoints;
+    mutable TArray<int32> CachedLakeSplinePointStarts;
+    mutable int32 CachedLakeSplinePointCount = INDEX_NONE;
+    mutable float CachedLakeSplineLength = -1.0f;
 };

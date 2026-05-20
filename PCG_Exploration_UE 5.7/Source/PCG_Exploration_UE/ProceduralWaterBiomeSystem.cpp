@@ -4,11 +4,13 @@
 #include "Components/SplineComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Texture2D.h"
+#include "Engine/World.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ProceduralLandmass.h"
 #include "WaterBodyActor.h"
 #include "WaterBodyComponent.h"
+#include "WaterBodyLakeActor.h"
 #include "WaterBodyOceanComponent.h"
 #include "WaterBodyTypes.h"
 #include "WaterWaves.h"
@@ -58,6 +60,8 @@ struct FSeaStateTextureWorldBounds
     float SizeX = 1.0f;
     float SizeY = 1.0f;
 };
+
+const FName ProceduralGeneratedLakeTag(TEXT("ProceduralGeneratedLake"));
 
 FSeaStateTextureWorldBounds GetSeaStateTextureWorldBounds(const AProceduralWaterBiomeSystem* System)
 {
@@ -163,7 +167,12 @@ void AProceduralWaterBiomeSystem::PostEditChangeProperty(FPropertyChangedEvent& 
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralWaterBiomeSystem, PrimaryWaveDirectionProbeCount))
     {
         SeaStateTexture = nullptr;
+        bSeaStateTextureDirty = true;
         RefreshWaterRendering(WaterBodyLakeActor);
+        for (AActor* AdditionalLakeActor : AdditionalWaterBodyLakeActors)
+        {
+            RefreshWaterRendering(AdditionalLakeActor);
+        }
         RefreshWaterRendering(WaterBodyOceanActor);
     }
 }
@@ -171,6 +180,7 @@ void AProceduralWaterBiomeSystem::PostEditChangeProperty(FPropertyChangedEvent& 
 
 void AProceduralWaterBiomeSystem::FitLakeSplineToLandmass()
 {
+    InvalidateWaterQueryCache();
     FitLakeSplineToInlandBasin();
     if (bFitWaterZoneToLandmass)
     {
@@ -180,6 +190,7 @@ void AProceduralWaterBiomeSystem::FitLakeSplineToLandmass()
 
 void AProceduralWaterBiomeSystem::FitOceanSplineToLandmass()
 {
+    InvalidateWaterQueryCache();
     if (!FitOceanSplineToOuterCoastline(OceanBoundsPadding))
     {
         FitWaterActorSplineToLandmass(WaterBodyOceanActor, OceanBoundsPadding);
@@ -192,9 +203,18 @@ void AProceduralWaterBiomeSystem::FitOceanSplineToLandmass()
 
 void AProceduralWaterBiomeSystem::SyncWaterActorsToLandmass()
 {
+    InvalidateWaterQueryCache();
     EnsureWaterBodyRenderable(WaterBodyLakeActor);
+    for (AActor* AdditionalLakeActor : AdditionalWaterBodyLakeActors)
+    {
+        EnsureWaterBodyRenderable(AdditionalLakeActor);
+    }
     EnsureWaterBodyRenderable(WaterBodyOceanActor);
     SyncWaterActorHeight(WaterBodyLakeActor);
+    for (AActor* AdditionalLakeActor : AdditionalWaterBodyLakeActors)
+    {
+        SyncWaterActorHeight(AdditionalLakeActor);
+    }
     SyncWaterActorHeight(WaterBodyOceanActor);
 }
 
@@ -222,6 +242,7 @@ void AProceduralWaterBiomeSystem::FitWaterZoneToLandmass()
 
 void AProceduralWaterBiomeSystem::FitAllWaterToLandmass()
 {
+    InvalidateWaterQueryCache();
     SyncWaterActorsToLandmass();
     FitLakeSplineToInlandBasin();
     if (!FitOceanSplineToOuterCoastline(OceanBoundsPadding))
@@ -258,6 +279,10 @@ void AProceduralWaterBiomeSystem::DiagnoseWaterBodies() const
         *StaticEnum<EWaterSplineFitShape>()->GetNameStringByValue(static_cast<int64>(GetWaterActorFitShape(WaterBodyOceanActor))));
 
     LogWaterBodyDiagnostics(TEXT("Lake"), WaterBodyLakeActor);
+    for (int32 AdditionalLakeIndex = 0; AdditionalLakeIndex < AdditionalWaterBodyLakeActors.Num(); ++AdditionalLakeIndex)
+    {
+        LogWaterBodyDiagnostics(*FString::Printf(TEXT("AdditionalLake%d"), AdditionalLakeIndex + 2), AdditionalWaterBodyLakeActors[AdditionalLakeIndex]);
+    }
     LogWaterBodyDiagnostics(TEXT("Ocean"), WaterBodyOceanActor);
 
     if (const AWaterZone* WaterZone = Cast<AWaterZone>(WaterZoneActor))
@@ -421,14 +446,6 @@ bool AProceduralWaterBiomeSystem::FitLakeSplineToInlandBasin()
         return false;
     }
 
-    EnsureWaterBodyRenderable(WaterBodyLakeActor);
-
-    USplineComponent* SplineComponent = FindEditableWaterSpline(WaterBodyLakeActor);
-    if (!SplineComponent)
-    {
-        return false;
-    }
-
     const int32 SampleWidth = FMath::Max(LandmassActor->MapWidth, 2);
     const int32 SampleHeight = FMath::Max(LandmassActor->MapHeight, 2);
     const float CellSize = FMath::Max(LandmassActor->GridSize, 1.0f);
@@ -516,8 +533,9 @@ bool AProceduralWaterBiomeSystem::FitLakeSplineToInlandBasin()
 
     TArray<uint8> bVisited;
     bVisited.Init(0, bBelowWater.Num());
-    FInlandLakeRegion BestRegion;
+    TArray<FInlandLakeRegion> LakeRegions;
     TArray<int32> RegionCells;
+    const int32 MinimumRegionCells = FMath::Max(MinimumAdditionalLakeRegionCells, 4);
 
     for (int32 Y = 1; Y < SampleHeight - 1; ++Y)
     {
@@ -578,20 +596,26 @@ bool AProceduralWaterBiomeSystem::FitLakeSplineToInlandBasin()
                 }
             }
 
-            if (RegionCellCount > BestRegion.CellCount)
+            if (RegionCellCount >= MinimumRegionCells)
             {
-                BestRegion.bFound = true;
-                BestRegion.CellCount = RegionCellCount;
-                BestRegion.CenterLocal = PositionSum / static_cast<float>(RegionCellCount);
-                BestRegion.ExtentLocal = FVector2D(
+                FInlandLakeRegion& Region = LakeRegions.AddDefaulted_GetRef();
+                Region.bFound = true;
+                Region.CellCount = RegionCellCount;
+                Region.CenterLocal = PositionSum / static_cast<float>(RegionCellCount);
+                Region.ExtentLocal = FVector2D(
                     FMath::Max((MaxX - MinX + 1) * CellSize * 0.5f, CellSize * 1.5f),
                     FMath::Max((MaxY - MinY + 1) * CellSize * 0.5f, CellSize * 1.5f));
-                BestRegion.Cells = RegionCells;
+                Region.Cells = RegionCells;
             }
         }
     }
 
-    if (!BestRegion.bFound || BestRegion.CellCount < 4)
+    LakeRegions.Sort([](const FInlandLakeRegion& A, const FInlandLakeRegion& B)
+    {
+        return A.CellCount > B.CellCount;
+    });
+
+    if (LakeRegions.IsEmpty())
     {
         UE_LOG(LogProceduralWaterBiome, Warning, TEXT("FitLakeSplineToInlandBasin: no enclosed inland basin found below water level."));
         return false;
@@ -599,133 +623,239 @@ bool AProceduralWaterBiomeSystem::FitLakeSplineToInlandBasin()
 
     const float LandmassWidth = FMath::Max(0, LandmassActor->MapWidth - 1) * LandmassActor->GridSize;
     const float LandmassHeight = FMath::Max(0, LandmassActor->MapHeight - 1) * LandmassActor->GridSize;
-    BestRegion.CenterLocal.X = FMath::Clamp(BestRegion.CenterLocal.X, 0.0f, LandmassWidth);
-    BestRegion.CenterLocal.Y = FMath::Clamp(BestRegion.CenterLocal.Y, 0.0f, LandmassHeight);
 
-    TArray<uint8> bBestRegionMask;
-    bBestRegionMask.Init(0, bBelowWater.Num());
-    for (const int32 RegionCell : BestRegion.Cells)
+    auto FitLakeActorToRegion = [&](AActor* LakeActor, FInlandLakeRegion& Region) -> bool
     {
-        if (bBestRegionMask.IsValidIndex(RegionCell))
-        {
-            bBestRegionMask[RegionCell] = 1;
-        }
-    }
-
-    auto IsInsideBestRegion = [&](const FVector2D& LocalPoint) -> bool
-    {
-        const int32 CellX = FMath::Clamp(FMath::RoundToInt(LocalPoint.X / CellSize), 0, SampleWidth - 1);
-        const int32 CellY = FMath::Clamp(FMath::RoundToInt(LocalPoint.Y / CellSize), 0, SampleHeight - 1);
-        const int32 Index = CellIndex(CellX, CellY);
-        if (!bBestRegionMask.IsValidIndex(Index) || !bBestRegionMask[Index])
+        if (!LakeActor)
         {
             return false;
         }
 
-        const FVector WorldPoint = LandmassTransform.TransformPosition(FVector(LocalPoint.X, LocalPoint.Y, 0.0f));
-        const float TerrainZ = LandmassActor->GetTerrainHeightAtWorldLocation(WorldPoint);
-        return (WaterZ - TerrainZ) > 1.0f;
-    };
+        EnsureWaterBodyRenderable(LakeActor);
 
-    const float MaxBoundingRadius = FVector2D(BestRegion.ExtentLocal.X, BestRegion.ExtentLocal.Y).Length();
-    const float MarchStep = FMath::Max(CellSize * 0.4f, 50.0f);
-    const float SafetyInset = FMath::Clamp(CellSize * 0.85f, 50.0f, CellSize * 2.0f);
-    const float ShoreOverlapDistance = FMath::Max(0.0f, LakeShoreOverlapDistance);
-
-    const int32 NumPoints = GetWaterActorFitSplinePointCount(WaterBodyLakeActor);
-    TArray<FVector> SplinePoints;
-    SplinePoints.Reserve(NumPoints);
-
-#if WITH_EDITOR
-    WaterBodyLakeActor->Modify();
-    SplineComponent->Modify();
-#endif
-
-    if (bFitWaterActorsToLandmassWaterHeight)
-    {
-        FVector LakeLocation = WaterBodyLakeActor->GetActorLocation();
-        LakeLocation.Z = WaterZ;
-        WaterBodyLakeActor->SetActorLocation(LakeLocation);
-    }
-
-    for (int32 PointIndex = 0; PointIndex < NumPoints; ++PointIndex)
-    {
-        const float Angle = (static_cast<float>(PointIndex) / static_cast<float>(NumPoints)) * UE_TWO_PI;
-        const FVector2D Direction(FMath::Cos(Angle), FMath::Sin(Angle));
-        FVector2D LastValidPoint = BestRegion.CenterLocal;
-
-        for (float Distance = MarchStep; Distance <= MaxBoundingRadius; Distance += MarchStep)
+        USplineComponent* SplineComponent = FindEditableWaterSpline(LakeActor);
+        if (!SplineComponent)
         {
-            const FVector2D CandidatePoint = BestRegion.CenterLocal + Direction * Distance;
-            if (!IsInsideBestRegion(CandidatePoint))
+            return false;
+        }
+
+        Region.CenterLocal.X = FMath::Clamp(Region.CenterLocal.X, 0.0f, LandmassWidth);
+        Region.CenterLocal.Y = FMath::Clamp(Region.CenterLocal.Y, 0.0f, LandmassHeight);
+
+        TArray<uint8> bRegionMask;
+        bRegionMask.Init(0, bBelowWater.Num());
+        for (const int32 RegionCell : Region.Cells)
+        {
+            if (bRegionMask.IsValidIndex(RegionCell))
             {
-                break;
+                bRegionMask[RegionCell] = 1;
+            }
+        }
+
+        auto IsInsideRegion = [&](const FVector2D& LocalPoint) -> bool
+        {
+            const int32 CellX = FMath::Clamp(FMath::RoundToInt(LocalPoint.X / CellSize), 0, SampleWidth - 1);
+            const int32 CellY = FMath::Clamp(FMath::RoundToInt(LocalPoint.Y / CellSize), 0, SampleHeight - 1);
+            const int32 Index = CellIndex(CellX, CellY);
+            if (!bRegionMask.IsValidIndex(Index) || !bRegionMask[Index])
+            {
+                return false;
             }
 
-            LastValidPoint = CandidatePoint;
-        }
+            const FVector WorldPoint = LandmassTransform.TransformPosition(FVector(LocalPoint.X, LocalPoint.Y, 0.0f));
+            const float TerrainZ = LandmassActor->GetTerrainHeightAtWorldLocation(WorldPoint);
+            return (WaterZ - TerrainZ) > 1.0f;
+        };
 
-        const FVector2D ToBoundary = LastValidPoint - BestRegion.CenterLocal;
-        const float BoundaryDistance = ToBoundary.Length();
-        FVector2D LocalPoint2D = LastValidPoint;
-        if (BoundaryDistance > KINDA_SMALL_NUMBER)
-        {
-            const float InsetDistance = FMath::Min(SafetyInset, BoundaryDistance * 0.35f);
-            LocalPoint2D -= (ToBoundary / BoundaryDistance) * InsetDistance;
-            LocalPoint2D += (ToBoundary / BoundaryDistance) * FMath::Min(ShoreOverlapDistance, CellSize * 2.5f);
-        }
+        const float MaxBoundingRadius = FVector2D(Region.ExtentLocal.X, Region.ExtentLocal.Y).Length();
+        const float MarchStep = FMath::Max(CellSize * 0.4f, 50.0f);
+        const float SafetyInset = FMath::Clamp(CellSize * 0.85f, 50.0f, CellSize * 2.0f);
+        const float ShoreOverlapDistance = FMath::Max(0.0f, LakeShoreOverlapDistance);
 
-        FVector LocalPoint(LocalPoint2D.X, LocalPoint2D.Y, 0.0f);
-
-        FVector WorldPoint = LandmassTransform.TransformPosition(LocalPoint);
-        WorldPoint.Z = WaterZ;
-        SplinePoints.Add(WorldPoint);
-    }
+        const int32 NumPoints = GetWaterActorFitSplinePointCount(LakeActor);
+        TArray<FVector> SplinePoints;
+        SplinePoints.Reserve(NumPoints);
 
 #if WITH_EDITOR
-    if (UWaterSplineComponent* WaterSplineComponent = Cast<UWaterSplineComponent>(SplineComponent))
-    {
-        TArray<FVector> LocalSplinePoints;
-        LocalSplinePoints.Reserve(SplinePoints.Num());
-        const FTransform SplineTransform = WaterSplineComponent->GetComponentTransform();
-        for (const FVector& WorldPoint : SplinePoints)
-        {
-            LocalSplinePoints.Add(SplineTransform.InverseTransformPosition(WorldPoint));
-        }
-
-        WaterSplineComponent->ResetSpline(LocalSplinePoints);
-    }
-    else
+        LakeActor->Modify();
+        SplineComponent->Modify();
 #endif
-    {
-        SplineComponent->ClearSplinePoints(false);
-        for (const FVector& Point : SplinePoints)
+
+        FVector LakeLocation = LakeActor->GetActorLocation();
+        if (bFitWaterActorsToLandmassWaterHeight)
         {
-            SplineComponent->AddSplinePoint(Point, ESplineCoordinateSpace::World, false);
+            LakeLocation.Z = WaterZ;
         }
-    }
+        const FVector RegionWorldCenter = LandmassTransform.TransformPosition(FVector(Region.CenterLocal.X, Region.CenterLocal.Y, 0.0f));
+        LakeLocation.X = RegionWorldCenter.X;
+        LakeLocation.Y = RegionWorldCenter.Y;
+        LakeActor->SetActorLocation(LakeLocation);
 
-    SplineComponent->SetClosedLoop(true, false);
-    for (int32 PointIndex = 0; PointIndex < SplineComponent->GetNumberOfSplinePoints(); ++PointIndex)
-    {
-        SplineComponent->SetSplinePointType(PointIndex, ESplinePointType::Curve, false);
-    }
+        for (int32 PointIndex = 0; PointIndex < NumPoints; ++PointIndex)
+        {
+            const float Angle = (static_cast<float>(PointIndex) / static_cast<float>(NumPoints)) * UE_TWO_PI;
+            const FVector2D Direction(FMath::Cos(Angle), FMath::Sin(Angle));
+            FVector2D LastValidPoint = Region.CenterLocal;
 
-    SplineComponent->UpdateSpline();
-    if (UWaterSplineComponent* WaterSplineComponent = Cast<UWaterSplineComponent>(SplineComponent))
-    {
-        WaterSplineComponent->K2_SynchronizeAndBroadcastDataChange();
-    }
+            for (float Distance = MarchStep; Distance <= MaxBoundingRadius; Distance += MarchStep)
+            {
+                const FVector2D CandidatePoint = Region.CenterLocal + Direction * Distance;
+                if (!IsInsideRegion(CandidatePoint))
+                {
+                    break;
+                }
 
-    RefreshWaterRendering(WaterBodyLakeActor);
-    WaterBodyLakeActor->MarkComponentsRenderStateDirty();
+                LastValidPoint = CandidatePoint;
+            }
+
+            const FVector2D ToBoundary = LastValidPoint - Region.CenterLocal;
+            const float BoundaryDistance = ToBoundary.Length();
+            FVector2D LocalPoint2D = LastValidPoint;
+            if (BoundaryDistance > KINDA_SMALL_NUMBER)
+            {
+                const float InsetDistance = FMath::Min(SafetyInset, BoundaryDistance * 0.35f);
+                LocalPoint2D -= (ToBoundary / BoundaryDistance) * InsetDistance;
+                LocalPoint2D += (ToBoundary / BoundaryDistance) * FMath::Min(ShoreOverlapDistance, CellSize * 2.5f);
+            }
+
+            FVector WorldPoint = LandmassTransform.TransformPosition(FVector(LocalPoint2D.X, LocalPoint2D.Y, 0.0f));
+            WorldPoint.Z = WaterZ;
+            SplinePoints.Add(WorldPoint);
+        }
 
 #if WITH_EDITOR
-    WaterBodyLakeActor->MarkPackageDirty();
-    SplineComponent->MarkPackageDirty();
+        if (UWaterSplineComponent* WaterSplineComponent = Cast<UWaterSplineComponent>(SplineComponent))
+        {
+            TArray<FVector> LocalSplinePoints;
+            LocalSplinePoints.Reserve(SplinePoints.Num());
+            const FTransform SplineTransform = WaterSplineComponent->GetComponentTransform();
+            for (const FVector& WorldPoint : SplinePoints)
+            {
+                LocalSplinePoints.Add(SplineTransform.InverseTransformPosition(WorldPoint));
+            }
+
+            WaterSplineComponent->ResetSpline(LocalSplinePoints);
+        }
+        else
+#endif
+        {
+            SplineComponent->ClearSplinePoints(false);
+            for (const FVector& Point : SplinePoints)
+            {
+                SplineComponent->AddSplinePoint(Point, ESplineCoordinateSpace::World, false);
+            }
+        }
+
+        SplineComponent->SetClosedLoop(true, false);
+        for (int32 PointIndex = 0; PointIndex < SplineComponent->GetNumberOfSplinePoints(); ++PointIndex)
+        {
+            SplineComponent->SetSplinePointType(PointIndex, ESplinePointType::Curve, false);
+        }
+
+        SplineComponent->UpdateSpline();
+        if (UWaterSplineComponent* WaterSplineComponent = Cast<UWaterSplineComponent>(SplineComponent))
+        {
+            WaterSplineComponent->K2_SynchronizeAndBroadcastDataChange();
+        }
+
+        RefreshWaterRendering(LakeActor);
+        LakeActor->MarkComponentsRenderStateDirty();
+
+#if WITH_EDITOR
+        LakeActor->MarkPackageDirty();
+        SplineComponent->MarkPackageDirty();
 #endif
 
-    return true;
+        return true;
+    };
+
+    bool bFittedAnyLake = FitLakeActorToRegion(WaterBodyLakeActor, LakeRegions[0]);
+    const int32 DesiredAdditionalLakeCount = bAutoCreateAdditionalLakeActors
+        ? FMath::Clamp(LakeRegions.Num() - 1, 0, FMath::Max(MaxAutoLakeActors, 0))
+        : FMath::Min(AdditionalWaterBodyLakeActors.Num(), LakeRegions.Num() - 1);
+
+    for (int32 AdditionalLakeIndex = 0; AdditionalLakeIndex < DesiredAdditionalLakeCount; ++AdditionalLakeIndex)
+    {
+        FInlandLakeRegion& Region = LakeRegions[AdditionalLakeIndex + 1];
+        const FVector SpawnLocation = LandmassTransform.TransformPosition(FVector(Region.CenterLocal.X, Region.CenterLocal.Y, WaterZ));
+        AActor* AdditionalLakeActor = bAutoCreateAdditionalLakeActors
+            ? GetOrCreateAdditionalLakeActor(AdditionalLakeIndex, SpawnLocation)
+            : AdditionalWaterBodyLakeActors[AdditionalLakeIndex];
+
+        bFittedAnyLake |= FitLakeActorToRegion(AdditionalLakeActor, Region);
+    }
+
+    for (int32 ExtraLakeIndex = DesiredAdditionalLakeCount; ExtraLakeIndex < AdditionalWaterBodyLakeActors.Num(); ++ExtraLakeIndex)
+    {
+        AActor* ExtraLakeActor = AdditionalWaterBodyLakeActors[ExtraLakeIndex];
+        if (ExtraLakeActor && ExtraLakeActor->Tags.Contains(ProceduralGeneratedLakeTag))
+        {
+#if WITH_EDITOR
+            ExtraLakeActor->Modify();
+#endif
+            ExtraLakeActor->Destroy();
+        }
+    }
+    AdditionalWaterBodyLakeActors.SetNum(DesiredAdditionalLakeCount);
+
+    UE_LOG(LogProceduralWaterBiome, Display, TEXT("FitLakeSplineToInlandBasin: fitted %d inland lake region(s)."), bFittedAnyLake ? DesiredAdditionalLakeCount + 1 : 0);
+    return bFittedAnyLake;
+}
+
+AActor* AProceduralWaterBiomeSystem::GetOrCreateAdditionalLakeActor(int32 AdditionalLakeIndex, const FVector& SpawnLocation)
+{
+    if (AdditionalLakeIndex < 0 || !GetWorld())
+    {
+        return nullptr;
+    }
+
+    if (AdditionalWaterBodyLakeActors.IsValidIndex(AdditionalLakeIndex) &&
+        AdditionalWaterBodyLakeActors[AdditionalLakeIndex])
+    {
+        return AdditionalWaterBodyLakeActors[AdditionalLakeIndex];
+    }
+
+    AdditionalWaterBodyLakeActors.SetNum(FMath::Max(AdditionalWaterBodyLakeActors.Num(), AdditionalLakeIndex + 1));
+
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.Name = MakeUniqueObjectName(GetWorld()->GetCurrentLevel(), AWaterBodyLake::StaticClass(), TEXT("GeneratedWaterBodyLake"));
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+#if WITH_EDITOR
+    SpawnParams.bHideFromSceneOutliner = false;
+#endif
+
+    AWaterBodyLake* LakeActor = GetWorld()->SpawnActor<AWaterBodyLake>(
+        AWaterBodyLake::StaticClass(),
+        SpawnLocation,
+        FRotator::ZeroRotator,
+        SpawnParams);
+    if (!LakeActor)
+    {
+        return nullptr;
+    }
+
+    LakeActor->Tags.AddUnique(ProceduralGeneratedLakeTag);
+
+#if WITH_EDITOR
+    LakeActor->SetActorLabel(FString::Printf(TEXT("WaterBodyLake_Generated_%02d"), AdditionalLakeIndex + 2));
+    if (WaterBodyLakeActor)
+    {
+        LakeActor->SetFolderPath(WaterBodyLakeActor->GetFolderPath());
+    }
+    LakeActor->MarkPackageDirty();
+#endif
+
+    AdditionalWaterBodyLakeActors[AdditionalLakeIndex] = LakeActor;
+    return LakeActor;
+}
+
+bool AProceduralWaterBiomeSystem::IsLakeWaterActor(const AActor* WaterActor) const
+{
+    return WaterActor &&
+        (WaterActor == WaterBodyLakeActor || AdditionalWaterBodyLakeActors.ContainsByPredicate([WaterActor](const AActor* LakeActor)
+        {
+            return LakeActor == WaterActor;
+        }));
 }
 
 bool AProceduralWaterBiomeSystem::FitOceanSplineToOuterCoastline(float OceanExtentPadding)
@@ -1296,7 +1426,7 @@ void AProceduralWaterBiomeSystem::ApplyWaterBodyOverlapPriority(AActor* WaterAct
         return;
     }
 
-    const int32 DesiredPriority = (WaterActor == WaterBodyLakeActor)
+    const int32 DesiredPriority = IsLakeWaterActor(WaterActor)
         ? LakeOverlapMaterialPriority
         : (WaterActor == WaterBodyOceanActor ? OceanOverlapMaterialPriority : 0);
 
@@ -1377,7 +1507,7 @@ void AProceduralWaterBiomeSystem::ApplyWaterMaterialVisualSettings(AActor* Water
         MaterialInstance->SetScalarParameterValue(TEXT("NearNormal_Flatten"), FMath::Clamp(1.0f - OceanShoreWaveVisualIntensity, 0.0f, 1.0f));
         MaterialInstance->SetScalarParameterValue(TEXT("FarNormal_Flatten"), FMath::Clamp(1.0f - OceanFarNormalVisualIntensity, 0.0f, 1.0f));
     }
-    else if (WaterActor == WaterBodyLakeActor)
+    else if (IsLakeWaterActor(WaterActor))
     {
         MaterialInstance->SetScalarParameterValue(TEXT("Lake1_NormalIntensity"), LakeWaveVisualIntensity);
         MaterialInstance->SetScalarParameterValue(TEXT("Lake2_NormalIntensity"), LakeWaveVisualIntensity);
@@ -1401,6 +1531,11 @@ void AProceduralWaterBiomeSystem::UpdateSeaStateTexture() const
         !SeaStateTexture->GetPlatformData() ||
         SeaStateTexture->GetSizeX() != Resolution ||
         SeaStateTexture->GetSizeY() != Resolution;
+
+    if (!bSeaStateTextureDirty && !bNeedsNewTexture)
+    {
+        return;
+    }
 
     if (bNeedsNewTexture)
     {
@@ -1440,7 +1575,7 @@ void AProceduralWaterBiomeSystem::UpdateSeaStateTexture() const
             const float U = (static_cast<float>(PixelX) + 0.5f) / static_cast<float>(Resolution);
             const float WorldX = TextureBounds.MinX + U * TextureBounds.SizeX;
             const FVector SampleLocation(WorldX, WorldY, GetWaterSurfaceZ());
-            const float WaveEnergy = GetWaveEnergyAtWorldLocation(SampleLocation);
+            const float WaveEnergy = GetFastWaveEnergyAtWorldLocation(SampleLocation);
             const uint8 EncodedEnergy = static_cast<uint8>(FMath::RoundToInt(FMath::Clamp(WaveEnergy, 0.0f, 1.0f) * 255.0f));
 
             TexturePixels[PixelY * Resolution + PixelX] = FColor(EncodedEnergy, EncodedEnergy, EncodedEnergy, 255);
@@ -1449,6 +1584,7 @@ void AProceduralWaterBiomeSystem::UpdateSeaStateTexture() const
 
     Mip.BulkData.Unlock();
     SeaStateTexture->UpdateResource();
+    bSeaStateTextureDirty = false;
 }
 
 void AProceduralWaterBiomeSystem::ApplySeaStateTextureParameters(UMaterialInstanceDynamic* MaterialInstance) const
@@ -1494,7 +1630,7 @@ UMaterialInstanceDynamic* AProceduralWaterBiomeSystem::GetOrCreateWaterMaterialI
     }
 
     TObjectPtr<UMaterialInstanceDynamic>& CachedInstance =
-        (WaterActor == WaterBodyLakeActor) ? LakeWaterMaterialInstance : OceanWaterMaterialInstance;
+        IsLakeWaterActor(WaterActor) ? LakeWaterMaterialInstance : OceanWaterMaterialInstance;
 
     if (CachedInstance)
     {
@@ -1781,6 +1917,73 @@ USplineComponent* AProceduralWaterBiomeSystem::FindEditableWaterSpline(AActor* W
     return SplineComponents.Num() > 0 ? SplineComponents[0] : nullptr;
 }
 
+void AProceduralWaterBiomeSystem::InvalidateWaterQueryCache() const
+{
+    CachedLakeSplineComponent.Reset();
+    CachedLakeSplinePoints.Reset();
+    CachedLakeSplinePointStarts.Reset();
+    CachedLakeSplinePointCount = INDEX_NONE;
+    CachedLakeSplineLength = -1.0f;
+    bSeaStateTextureDirty = true;
+}
+
+void AProceduralWaterBiomeSystem::RebuildLakeSplineQueryCache() const
+{
+    if (CachedLakeSplinePoints.Num() > 0 && CachedLakeSplinePointStarts.Num() > 0)
+    {
+        return;
+    }
+
+    CachedLakeSplineComponent.Reset();
+    CachedLakeSplinePoints.Reset();
+    CachedLakeSplinePointStarts.Reset();
+    CachedLakeSplinePointCount = 0;
+    CachedLakeSplineLength = 0.0f;
+
+    TArray<AActor*> LakeActors;
+    LakeActors.Reserve(AdditionalWaterBodyLakeActors.Num() + 1);
+    if (WaterBodyLakeActor)
+    {
+        LakeActors.Add(WaterBodyLakeActor);
+    }
+    for (AActor* AdditionalLakeActor : AdditionalWaterBodyLakeActors)
+    {
+        if (AdditionalLakeActor)
+        {
+            LakeActors.Add(AdditionalLakeActor);
+        }
+    }
+
+    for (const AActor* LakeActor : LakeActors)
+    {
+        const USplineComponent* SplineComponent = FindEditableWaterSpline(const_cast<AActor*>(LakeActor));
+        if (!SplineComponent || SplineComponent->GetNumberOfSplinePoints() < 3)
+        {
+            continue;
+        }
+
+        const int32 SplinePointCount = SplineComponent->GetNumberOfSplinePoints();
+        const float SplineLength = SplineComponent->GetSplineLength();
+        if (SplineLength <= KINDA_SMALL_NUMBER)
+        {
+            continue;
+        }
+
+        CachedLakeSplinePointStarts.Add(CachedLakeSplinePoints.Num());
+        CachedLakeSplinePointCount += SplinePointCount;
+        CachedLakeSplineLength += SplineLength;
+
+        const int32 NumSamples = FMath::Max(SplinePointCount * 8, 32);
+        CachedLakeSplinePoints.Reserve(CachedLakeSplinePoints.Num() + NumSamples);
+        for (int32 Index = 0; Index < NumSamples; ++Index)
+        {
+            const float Alpha = static_cast<float>(Index) / static_cast<float>(NumSamples);
+            const FVector Point = SplineComponent->GetLocationAtDistanceAlongSpline(SplineLength * Alpha, ESplineCoordinateSpace::World);
+            CachedLakeSplinePoints.Add(FVector2D(Point.X, Point.Y));
+        }
+    }
+}
+
 float AProceduralWaterBiomeSystem::GetWaterSurfaceZ() const
 {
     if (bUseWaterBodyLakeActorHeight && WaterBodyLakeActor)
@@ -1835,25 +2038,63 @@ EProceduralWaterBiome AProceduralWaterBiomeSystem::GetWaterBiomeAtWorldLocation(
 
     const float TerrainZ = LandmassActor->GetTerrainHeightAtWorldLocation(WorldLocation);
     const float WaterDepth = GetWaterSurfaceZ() - TerrainZ;
+    const bool bInsideLandmass = IsInsideLandmassXY(WorldLocation);
+
+    bool bFoundLakeSpline = false;
+    bool bInsideLakeSpline = false;
+    const float DistanceToLakeSpline = GetDistanceToNearestLakeSplineEdge(WorldLocation, bFoundLakeSpline, bInsideLakeSpline);
+
+    if (bFoundLakeSpline && !bInsideLakeSpline)
+    {
+        if (bInsideLandmass && WaterDepth <= 0.0f)
+        {
+            return (FMath::Abs(WaterDepth) <= ShorelineBandHeight)
+                ? EProceduralWaterBiome::OceanWetShore
+                : EProceduralWaterBiome::DryLand;
+        }
+
+        if (DistanceToLakeSpline <= OceanWetShoreDistance)
+        {
+            return EProceduralWaterBiome::OceanWetShore;
+        }
+
+        if (DistanceToLakeSpline <= OceanShallowWaterDistance)
+        {
+            return EProceduralWaterBiome::OceanShallowWater;
+        }
+
+        if (DistanceToLakeSpline <= OceanLittoralShelfDistance)
+        {
+            return EProceduralWaterBiome::OceanLittoralShelf;
+        }
+
+        return EProceduralWaterBiome::OceanDeepWater;
+    }
 
     if (WaterDepth <= 0.0f)
     {
         return (FMath::Abs(WaterDepth) <= ShorelineBandHeight)
-            ? EProceduralWaterBiome::WetShore
+            ? (bInsideLakeSpline ? EProceduralWaterBiome::LakeWetShore : EProceduralWaterBiome::OceanWetShore)
             : EProceduralWaterBiome::DryLand;
     }
 
     if (WaterDepth <= ShallowWaterDepth)
     {
-        return EProceduralWaterBiome::ShallowWater;
+        return bInsideLakeSpline
+            ? EProceduralWaterBiome::LakeShallowWater
+            : EProceduralWaterBiome::OceanShallowWater;
     }
 
     if (WaterDepth <= LittoralShelfDepth)
     {
-        return EProceduralWaterBiome::LittoralShelf;
+        return bInsideLakeSpline
+            ? EProceduralWaterBiome::LakeLittoralShelf
+            : EProceduralWaterBiome::OceanLittoralShelf;
     }
 
-    return EProceduralWaterBiome::DeepWater;
+    return bInsideLakeSpline
+        ? EProceduralWaterBiome::LakeDeepWater
+        : EProceduralWaterBiome::OceanDeepWater;
 }
 
 float AProceduralWaterBiomeSystem::GetWaveEnergyAtWorldLocation(const FVector& WorldLocation) const
@@ -1863,13 +2104,37 @@ float AProceduralWaterBiomeSystem::GetWaveEnergyAtWorldLocation(const FVector& W
         return 0.0f;
     }
 
-    const float WaterDepth = GetWaterDepthAtWorldLocation(WorldLocation);
-    if (WaterDepth <= 0.0f)
+    if (!IsWaterAtWorldLocation(WorldLocation))
     {
         return 0.0f;
     }
 
-    const float DistanceToShoreline = GetDistanceToNearestShoreline(WorldLocation);
+    const float WaterDepth = GetWaterDepthAtWorldLocation(WorldLocation);
+    bool bFoundLakeSpline = false;
+    bool bInsideLakeSpline = false;
+    const float DistanceToLakeSpline = GetDistanceToNearestLakeSplineEdge(WorldLocation, bFoundLakeSpline, bInsideLakeSpline);
+
+    if (bFoundLakeSpline && bInsideLakeSpline)
+    {
+        const float LakeEdgeAlpha = FMath::Clamp(
+            DistanceToLakeSpline / FMath::Max(WaveShoreInfluenceDistance, 250.0f),
+            0.0f,
+            1.0f);
+        const float LakeDepthAlpha = FMath::Clamp(
+            WaterDepth / FMath::Max(ShallowWaterDepth, 1.0f),
+            0.0f,
+            1.0f);
+        return FMath::Clamp(LakeWaveEnergy * FMath::Lerp(0.65f, 1.0f, FMath::Max(LakeEdgeAlpha, LakeDepthAlpha)), 0.0f, 1.0f);
+    }
+
+    if (WaterDepth <= 0.0f && IsInsideLandmassXY(WorldLocation))
+    {
+        return 0.0f;
+    }
+
+    const float DistanceToShoreline = (bFoundLakeSpline && !bInsideLakeSpline)
+        ? DistanceToLakeSpline
+        : GetDistanceToNearestShoreline(WorldLocation);
     const float WaveExposure = GetWaveExposureAtWorldLocation(WorldLocation);
     const float DirectionalFetch = GetDirectionalWaveFetchAtWorldLocation(WorldLocation);
     const float CombinedExposure = FMath::Clamp(
@@ -1913,10 +2178,73 @@ float AProceduralWaterBiomeSystem::GetWaveEnergyAtWorldLocation(const FVector& W
     float BaseWaveEnergy = FMath::Lerp(CoastalEnergy, OpenOceanEnergy, OffshoreBlendAlpha);
     BaseWaveEnergy = FMath::Max(BaseWaveEnergy, CoastalEnergy);
 
+    const float EffectiveWaterDepth = (WaterDepth > 0.0f)
+        ? WaterDepth
+        : FMath::Max(DistanceToShoreline, LittoralShelfDepth);
     const float DepthAlpha = FMath::Clamp(
-        WaterDepth / FMath::Max(LittoralShelfDepth, 1.0f),
+        EffectiveWaterDepth / FMath::Max(LittoralShelfDepth, 1.0f),
         0.0f,
         1.0f);
+    const float DepthMultiplier = FMath::Lerp(1.0f - WaveDepthInfluence, 1.0f, DepthAlpha);
+    return FMath::Clamp(BaseWaveEnergy * DepthMultiplier, 0.0f, 1.0f);
+}
+
+float AProceduralWaterBiomeSystem::GetFastWaveEnergyAtWorldLocation(const FVector& WorldLocation) const
+{
+    if (!LandmassActor || !IsWaterAtWorldLocation(WorldLocation))
+    {
+        return 0.0f;
+    }
+
+    const float WaterDepth = GetWaterDepthAtWorldLocation(WorldLocation);
+
+    bool bFoundLakeSpline = false;
+    bool bInsideLakeSpline = false;
+    const float DistanceToLakeSpline = GetDistanceToNearestLakeSplineEdge(WorldLocation, bFoundLakeSpline, bInsideLakeSpline);
+
+    if (bFoundLakeSpline && bInsideLakeSpline)
+    {
+        const float LakeEdgeAlpha = FMath::Clamp(
+            DistanceToLakeSpline / FMath::Max(WaveShoreInfluenceDistance, 250.0f),
+            0.0f,
+            1.0f);
+        const float LakeDepthAlpha = FMath::Clamp(
+            WaterDepth / FMath::Max(ShallowWaterDepth, 1.0f),
+            0.0f,
+            1.0f);
+        return FMath::Clamp(LakeWaveEnergy * FMath::Lerp(0.65f, 1.0f, FMath::Max(LakeEdgeAlpha, LakeDepthAlpha)), 0.0f, 1.0f);
+    }
+
+    if (WaterDepth <= 0.0f && IsInsideLandmassXY(WorldLocation))
+    {
+        return 0.0f;
+    }
+
+    const float DistanceToShoreline = (bFoundLakeSpline && !bInsideLakeSpline)
+        ? DistanceToLakeSpline
+        : GetDistanceToNearestShoreline(WorldLocation);
+    const float ShoreDistanceAlpha = FMath::Clamp(
+        DistanceToShoreline / FMath::Max(WaveShoreInfluenceDistance, 250.0f),
+        0.0f,
+        1.0f);
+    const float OceanDistanceAlpha = FMath::Clamp(
+        DistanceToShoreline / FMath::Max(OpenOceanWaveRampDistance, 500.0f),
+        0.0f,
+        1.0f);
+
+    const float SmoothedShoreDistanceAlpha = FMath::InterpEaseInOut(0.0f, 1.0f, ShoreDistanceAlpha, 2.6f);
+    const float SmoothedOceanDistanceAlpha = FMath::InterpEaseInOut(0.0f, 1.0f, OceanDistanceAlpha, 1.8f);
+    const float EffectiveWaterDepth = (WaterDepth > 0.0f)
+        ? WaterDepth
+        : FMath::Max(DistanceToShoreline, LittoralShelfDepth);
+    const float DepthAlpha = FMath::Clamp(
+        EffectiveWaterDepth / FMath::Max(LittoralShelfDepth, 1.0f),
+        0.0f,
+        1.0f);
+
+    const float CoastalEnergy = FMath::Lerp(LakeWaveEnergy, OceanBoundaryWaveEnergy, SmoothedShoreDistanceAlpha);
+    const float OpenOceanEnergy = FMath::Lerp(OceanBoundaryWaveEnergy, OpenOceanWaveEnergy, SmoothedOceanDistanceAlpha);
+    const float BaseWaveEnergy = FMath::Lerp(CoastalEnergy, OpenOceanEnergy, SmoothedOceanDistanceAlpha);
     const float DepthMultiplier = FMath::Lerp(1.0f - WaveDepthInfluence, 1.0f, DepthAlpha);
     return FMath::Clamp(BaseWaveEnergy * DepthMultiplier, 0.0f, 1.0f);
 }
@@ -1957,7 +2285,7 @@ void AProceduralWaterBiomeSystem::DrawDebugBiomeGrid() const
             const float DrawZ = FMath::Max(TerrainZ, GetWaterSurfaceZ()) + DebugDrawZOffset;
             const FVector DrawLocation(SampleLocation.X, SampleLocation.Y, DrawZ);
             const FColor DebugColor = (DebugViewMode == EProceduralWaterDebugView::WaveEnergy)
-                ? GetDebugColorForWaveEnergy(GetWaveEnergyAtWorldLocation(SampleLocation))
+                ? GetDebugColorForWaveEnergy(GetFastWaveEnergyAtWorldLocation(SampleLocation))
                 : GetDebugColorForBiome(Biome);
 
             DrawDebugPoint(
@@ -1971,9 +2299,47 @@ void AProceduralWaterBiomeSystem::DrawDebugBiomeGrid() const
     }
 }
 
+bool AProceduralWaterBiomeSystem::IsInsideLandmassXY(const FVector& WorldLocation) const
+{
+    if (!LandmassActor || LandmassActor->GridSize <= KINDA_SMALL_NUMBER || LandmassActor->MapWidth < 2 || LandmassActor->MapHeight < 2)
+    {
+        return false;
+    }
+
+    const FVector LocalLocation = LandmassActor->GetActorTransform().InverseTransformPosition(WorldLocation);
+    const float WidthWorld = static_cast<float>(LandmassActor->MapWidth - 1) * LandmassActor->GridSize;
+    const float HeightWorld = static_cast<float>(LandmassActor->MapHeight - 1) * LandmassActor->GridSize;
+
+    return
+        LocalLocation.X >= 0.0f &&
+        LocalLocation.Y >= 0.0f &&
+        LocalLocation.X <= WidthWorld &&
+        LocalLocation.Y <= HeightWorld;
+}
+
+bool AProceduralWaterBiomeSystem::IsWaterAtWorldLocation(const FVector& WorldLocation) const
+{
+    bool bFoundLakeSpline = false;
+    bool bInsideLakeSpline = false;
+    GetDistanceToNearestLakeSplineEdge(WorldLocation, bFoundLakeSpline, bInsideLakeSpline);
+
+    if (bFoundLakeSpline && bInsideLakeSpline)
+    {
+        return true;
+    }
+
+    const float WaterDepth = GetWaterDepthAtWorldLocation(WorldLocation);
+    if (IsInsideLandmassXY(WorldLocation))
+    {
+        return WaterDepth > 0.0f || (bFoundLakeSpline && !bInsideLakeSpline);
+    }
+
+    return bFoundLakeSpline || WaterDepth > 0.0f;
+}
+
 bool AProceduralWaterBiomeSystem::IsInsideDebugWaterBounds(const FVector& WorldLocation) const
 {
-    if (!bLimitDebugToWaterBodyBounds || !WaterBodyLakeActor)
+    if (!bLimitDebugToWaterBodyBounds || (!WaterBodyLakeActor && !WaterBodyOceanActor))
     {
         return true;
     }
@@ -1982,16 +2348,27 @@ bool AProceduralWaterBiomeSystem::IsInsideDebugWaterBounds(const FVector& WorldL
     if (bPreferWaterBodySplineBounds)
     {
         const bool bInsideSpline = IsInsideAnyWaterSpline(WorldLocation, bFoundSpline);
-        if (bFoundSpline)
+        if (bFoundSpline && bInsideSpline)
         {
-            return bInsideSpline;
+            return true;
         }
     }
 
-    FBox Bounds = WaterBodyLakeActor->GetComponentsBoundingBox(true);
+    return IsInsideWaterBodyActorBounds(WaterBodyLakeActor, WorldLocation) ||
+        IsInsideWaterBodyActorBounds(WaterBodyOceanActor, WorldLocation);
+}
+
+bool AProceduralWaterBiomeSystem::IsInsideWaterBodyActorBounds(const AActor* WaterActor, const FVector& WorldLocation) const
+{
+    if (!WaterActor)
+    {
+        return false;
+    }
+
+    FBox Bounds = WaterActor->GetComponentsBoundingBox(true);
     if (!Bounds.IsValid)
     {
-        return true;
+        return false;
     }
 
     Bounds = Bounds.ExpandBy(FVector(DebugWaterBodyBoundsPadding, DebugWaterBodyBoundsPadding, HALF_WORLD_MAX));
@@ -2006,46 +2383,31 @@ bool AProceduralWaterBiomeSystem::IsInsideAnyWaterSpline(const FVector& WorldLoc
 {
     bFoundSpline = false;
 
-    if (!WaterBodyLakeActor)
+    RebuildLakeSplineQueryCache();
+    if (CachedLakeSplinePoints.Num() < 3 || CachedLakeSplinePointStarts.IsEmpty())
     {
         return false;
     }
 
-    TArray<USplineComponent*> SplineComponents;
-    WaterBodyLakeActor->GetComponents<USplineComponent>(SplineComponents);
+    bFoundSpline = true;
 
-    for (const USplineComponent* SplineComponent : SplineComponents)
+    for (int32 SplineIndex = 0; SplineIndex < CachedLakeSplinePointStarts.Num(); ++SplineIndex)
     {
-        if (!SplineComponent || SplineComponent->GetNumberOfSplinePoints() < 3)
+        const int32 StartIndex = CachedLakeSplinePointStarts[SplineIndex];
+        const int32 EndIndex = CachedLakeSplinePointStarts.IsValidIndex(SplineIndex + 1)
+            ? CachedLakeSplinePointStarts[SplineIndex + 1]
+            : CachedLakeSplinePoints.Num();
+        if (EndIndex - StartIndex < 3)
         {
             continue;
-        }
-
-        bFoundSpline = true;
-
-        const int32 NumSamples = FMath::Max(SplineComponent->GetNumberOfSplinePoints() * 8, 32);
-        TArray<FVector2D> Points;
-        Points.Reserve(NumSamples);
-
-        const float SplineLength = SplineComponent->GetSplineLength();
-        if (SplineLength <= KINDA_SMALL_NUMBER)
-        {
-            continue;
-        }
-
-        for (int32 Index = 0; Index < NumSamples; ++Index)
-        {
-            const float Alpha = static_cast<float>(Index) / static_cast<float>(NumSamples);
-            const FVector Point = SplineComponent->GetLocationAtDistanceAlongSpline(SplineLength * Alpha, ESplineCoordinateSpace::World);
-            Points.Add(FVector2D(Point.X, Point.Y));
         }
 
         bool bInside = false;
-        int32 PreviousIndex = Points.Num() - 1;
-        for (int32 Index = 0; Index < Points.Num(); ++Index)
+        int32 PreviousIndex = EndIndex - 1;
+        for (int32 Index = StartIndex; Index < EndIndex; ++Index)
         {
-            const FVector2D& A = Points[Index];
-            const FVector2D& B = Points[PreviousIndex];
+            const FVector2D& A = CachedLakeSplinePoints[Index];
+            const FVector2D& B = CachedLakeSplinePoints[PreviousIndex];
 
             const bool bYStraddles = (A.Y > WorldLocation.Y) != (B.Y > WorldLocation.Y);
             const float Denominator = B.Y - A.Y;
@@ -2271,48 +2633,31 @@ float AProceduralWaterBiomeSystem::GetDistanceToNearestLakeSplineEdge(const FVec
     bFoundSpline = false;
     bInsideLake = false;
 
-    if (!WaterBodyLakeActor)
+    RebuildLakeSplineQueryCache();
+    if (CachedLakeSplinePoints.Num() < 3 || CachedLakeSplinePointStarts.IsEmpty())
     {
         return 0.0f;
     }
 
-    TArray<USplineComponent*> SplineComponents;
-    WaterBodyLakeActor->GetComponents<USplineComponent>(SplineComponents);
-
     float NearestDistance = TNumericLimits<float>::Max();
 
-    for (const USplineComponent* SplineComponent : SplineComponents)
+    for (int32 SplineIndex = 0; SplineIndex < CachedLakeSplinePointStarts.Num(); ++SplineIndex)
     {
-        if (!SplineComponent || SplineComponent->GetNumberOfSplinePoints() < 3)
+        const int32 StartIndex = CachedLakeSplinePointStarts[SplineIndex];
+        const int32 EndIndex = CachedLakeSplinePointStarts.IsValidIndex(SplineIndex + 1)
+            ? CachedLakeSplinePointStarts[SplineIndex + 1]
+            : CachedLakeSplinePoints.Num();
+        if (EndIndex - StartIndex < 3)
         {
             continue;
         }
 
-        bFoundSpline = true;
-
-        const int32 NumSamples = FMath::Max(SplineComponent->GetNumberOfSplinePoints() * 8, 32);
-        TArray<FVector2D> Points;
-        Points.Reserve(NumSamples);
-
-        const float SplineLength = SplineComponent->GetSplineLength();
-        if (SplineLength <= KINDA_SMALL_NUMBER)
+        bool bInsideThisSpline = false;
+        int32 PreviousIndex = EndIndex - 1;
+        for (int32 Index = StartIndex; Index < EndIndex; ++Index)
         {
-            continue;
-        }
-
-        for (int32 Index = 0; Index < NumSamples; ++Index)
-        {
-            const float Alpha = static_cast<float>(Index) / static_cast<float>(NumSamples);
-            const FVector Point = SplineComponent->GetLocationAtDistanceAlongSpline(SplineLength * Alpha, ESplineCoordinateSpace::World);
-            Points.Add(FVector2D(Point.X, Point.Y));
-        }
-
-        bool bInside = false;
-        int32 PreviousIndex = Points.Num() - 1;
-        for (int32 Index = 0; Index < Points.Num(); ++Index)
-        {
-            const FVector2D& A = Points[Index];
-            const FVector2D& B = Points[PreviousIndex];
+            const FVector2D& A = CachedLakeSplinePoints[Index];
+            const FVector2D& B = CachedLakeSplinePoints[PreviousIndex];
 
             const bool bYStraddles = (A.Y > WorldLocation.Y) != (B.Y > WorldLocation.Y);
             const float Denominator = B.Y - A.Y;
@@ -2321,7 +2666,7 @@ float AProceduralWaterBiomeSystem::GetDistanceToNearestLakeSplineEdge(const FVec
                 const float IntersectionX = ((B.X - A.X) * (WorldLocation.Y - A.Y) / Denominator) + A.X;
                 if (WorldLocation.X < IntersectionX)
                 {
-                    bInside = !bInside;
+                    bInsideThisSpline = !bInsideThisSpline;
                 }
             }
 
@@ -2338,12 +2683,10 @@ float AProceduralWaterBiomeSystem::GetDistanceToNearestLakeSplineEdge(const FVec
             PreviousIndex = Index;
         }
 
-        if (bInside)
-        {
-            bInsideLake = true;
-        }
+        bInsideLake |= bInsideThisSpline;
     }
 
+    bFoundSpline = true;
     return (NearestDistance == TNumericLimits<float>::Max()) ? 0.0f : NearestDistance;
 }
 
@@ -2351,14 +2694,22 @@ FColor AProceduralWaterBiomeSystem::GetDebugColorForBiome(EProceduralWaterBiome 
 {
     switch (Biome)
     {
-    case EProceduralWaterBiome::WetShore:
-        return FColor(255, 180, 0);
-    case EProceduralWaterBiome::ShallowWater:
+    case EProceduralWaterBiome::LakeWetShore:
+        return FColor(105, 220, 170);
+    case EProceduralWaterBiome::LakeShallowWater:
         return FColor::Cyan;
-    case EProceduralWaterBiome::LittoralShelf:
-        return FColor::Magenta;
-    case EProceduralWaterBiome::DeepWater:
+    case EProceduralWaterBiome::LakeLittoralShelf:
+        return FColor(40, 135, 255);
+    case EProceduralWaterBiome::LakeDeepWater:
         return FColor(25, 25, 255);
+    case EProceduralWaterBiome::OceanWetShore:
+        return FColor(255, 180, 0);
+    case EProceduralWaterBiome::OceanShallowWater:
+        return FColor(255, 85, 40);
+    case EProceduralWaterBiome::OceanLittoralShelf:
+        return FColor::Magenta;
+    case EProceduralWaterBiome::OceanDeepWater:
+        return FColor(110, 35, 190);
     case EProceduralWaterBiome::DryLand:
     default:
         return FColor::Transparent;
