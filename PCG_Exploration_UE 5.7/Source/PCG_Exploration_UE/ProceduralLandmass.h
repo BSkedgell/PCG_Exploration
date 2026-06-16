@@ -7,8 +7,9 @@
 class UProceduralMeshComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class AProceduralCliffGenerator;
 
-UCLASS()
+UCLASS(meta = (DisplayName = "PCG Landmass"))
 class PCG_EXPLORATION_UE_API AProceduralLandmass : public AActor
 {
     GENERATED_BODY()
@@ -31,6 +32,9 @@ public:
 
     UFUNCTION(BlueprintPure, Category = "Terrain|Queries")
     float GetTerrainHeightAtWorldLocation(const FVector& WorldLocation) const;
+
+    UFUNCTION(BlueprintPure, Category = "Terrain|Queries")
+    float GetTerrainHeightAtWorldLocationClamped(const FVector& WorldLocation) const;
 
     // Components
     // ProceduralMesh is the heightfield terrain. OverhangMesh is separate geometry
@@ -196,27 +200,6 @@ public:
     UPROPERTY(EditAnywhere, Category = "Terrain|Landforms", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float PlateauRampStrength = 0.85f;
 
-    // Heightfield Cliff Bands
-    // Creates stepped/terraced rocky faces inside the terrain mesh. This is not
-    // true overhang geometry; it is a heightmap-safe visual cliff treatment.
-    UPROPERTY(EditAnywhere, Category = "Terrain|Cliffs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float CliffShelfStrength = 0.28f;
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Cliffs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float CliffShelfHeightMin = 0.62f;
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Cliffs", meta = (ClampMin = "2.0", ClampMax = "12.0"))
-    float CliffShelfFrequency = 6.0f;
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Cliffs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float CliffWallStrength = 0.45f;
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Cliffs", meta = (ClampMin = "0.05", ClampMax = "0.8"))
-    float CliffShelfFlatness = 0.22f;
-
-    UPROPERTY(EditAnywhere, Category = "Terrain|Cliffs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-    float CliffNoiseThreshold = 0.52f;
-
     // Procedural Overhang Mesh
     // Generated as separate closed geometry attached to steep terrain regions.
     // This is experimental/prototype-quality and intentionally kept isolated
@@ -248,6 +231,58 @@ public:
     UPROPERTY(EditAnywhere, Category = "Terrain|Overhangs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
     float OverhangNoiseAmount = 0.28f;
 
+    // Procedural Cliffs
+    // Spawns AProceduralCliffGenerator actors along eligible steep landmass runs.
+    // These are separate actors so the prototype cliff shell can evolve without
+    // replacing the main heightfield terrain.
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs")
+    bool bEnableProceduralCliffActors = false;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "0", ClampMax = "32"))
+    int32 MaxProceduralCliffActors = 4;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float ProceduralCliffSpawnChance = 0.65f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "2"))
+    int32 ProceduralCliffMinRunPoints = 6;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "100.0"))
+    float ProceduralCliffMinSpacing = 1800.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "250.0"))
+    float ProceduralCliffMaxLength = 3200.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs")
+    float ProceduralCliffSurfaceZOffset = -52.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "100.0"))
+    float ProceduralCliffHeight = 1000.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "10.0"))
+    float ProceduralCliffDepth = 250.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "0.0"))
+    float ProceduralCliffOverhangAmount = 1400.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "0.0", ClampMax = "45.0", UIMin = "0.0", UIMax = "25.0"))
+    float ProceduralCliffMaxTopSlopeDegrees = 15.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "1", UIMin = "2", UIMax = "16"))
+    int32 ProceduralCliffFrontCurveSegments = 4;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+    float ProceduralCliffFrontCurveStrength = 0.55f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "600.0"))
+    float ProceduralCliffFrontNoiseStrength = 55.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs", meta = (ClampMin = "1.0", UIMin = "50.0", UIMax = "1500.0"))
+    float ProceduralCliffFrontNoiseScale = 450.0f;
+
+    UPROPERTY(EditAnywhere, Category = "Procedural Cliffs")
+    UMaterialInterface* ProceduralCliffMaterial = nullptr;
+
     // Material Masks
     // Vertex colors generated for M_ProceduralTerrain:
     // R = beach, G = slope, B = height, A = dry-land mask.
@@ -262,12 +297,16 @@ public:
     UPROPERTY(EditAnywhere, Category = "Terrain|Material")
     UMaterialInterface* OverhangMaterial = nullptr;
 
+    UFUNCTION(BlueprintCallable, CallInEditor, Category = "Procedural Cliffs")
+    void ClearProceduralCliffActors();
+
 private:
     // Internal generation pipeline.
     void GenerateTerrain();
     void CreateMesh();
     void BuildHeightMap(TArray<float>& OutHeights) const;
     void BuildOverhangMesh(const TArray<float>& Heights, const TArray<FVector>& Normals);
+    void BuildProceduralCliffActors(const TArray<float>& Heights, const TArray<FVector>& Normals);
     void EnsureTerrainMaterialInstance();
     bool IsGenerationProperty(FName PropertyName) const;
     bool IsMaterialProperty(FName PropertyName) const;

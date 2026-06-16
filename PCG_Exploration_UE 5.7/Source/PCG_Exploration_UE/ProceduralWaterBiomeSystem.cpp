@@ -5,6 +5,7 @@
 #include "DrawDebugHelpers.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ProceduralLandmass.h"
@@ -1919,12 +1920,17 @@ USplineComponent* AProceduralWaterBiomeSystem::FindEditableWaterSpline(AActor* W
 
 void AProceduralWaterBiomeSystem::InvalidateWaterQueryCache() const
 {
+    InvalidateLakeSplineQueryCache();
+    bSeaStateTextureDirty = true;
+}
+
+void AProceduralWaterBiomeSystem::InvalidateLakeSplineQueryCache() const
+{
     CachedLakeSplineComponent.Reset();
     CachedLakeSplinePoints.Reset();
     CachedLakeSplinePointStarts.Reset();
     CachedLakeSplinePointCount = INDEX_NONE;
     CachedLakeSplineLength = -1.0f;
-    bSeaStateTextureDirty = true;
 }
 
 void AProceduralWaterBiomeSystem::RebuildLakeSplineQueryCache() const
@@ -1950,7 +1956,18 @@ void AProceduralWaterBiomeSystem::RebuildLakeSplineQueryCache() const
     {
         if (AdditionalLakeActor)
         {
-            LakeActors.Add(AdditionalLakeActor);
+            LakeActors.AddUnique(AdditionalLakeActor);
+        }
+    }
+    if (const UWorld* World = GetWorld())
+    {
+        for (TActorIterator<AWaterBodyLake> It(World); It; ++It)
+        {
+            AWaterBodyLake* LakeActor = *It;
+            if (LakeActor && !LakeActor->IsPendingKillPending())
+            {
+                LakeActors.AddUnique(LakeActor);
+            }
         }
     }
 
@@ -2264,6 +2281,12 @@ void AProceduralWaterBiomeSystem::DrawDebugBiomeGrid() const
     const float HalfExtent = bAutoSizeDebugGridToLandmass
         ? FMath::Max(AutoHalfExtent, Spacing)
         : FMath::Max(DebugGridExtent, Spacing);
+
+    // Editor actors and water spline components can be restored/moved outside of
+    // this controller after a crash or map reload. Refresh once per debug draw,
+    // then reuse the cache for every sample in this grid pass.
+    InvalidateLakeSplineQueryCache();
+    RebuildLakeSplineQueryCache();
 
     for (float Y = -HalfExtent; Y <= HalfExtent; Y += Spacing)
     {

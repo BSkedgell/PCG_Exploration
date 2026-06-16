@@ -10,6 +10,8 @@
 
 #include "ProceduralLandmass.h"
 
+#include "EngineUtils.h"
+#include "ProceduralCliffGenerator.h"
 #include "ProceduralMeshComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -263,6 +265,8 @@ void AddTriangle(
     Triangles.Add(BaseIndex + 1);
 }
 
+const FName ProceduralGeneratedCliffTag(TEXT("ProceduralGeneratedCliff"));
+
 }
 
 // ---------------------------------------------------------------------------
@@ -366,12 +370,6 @@ bool AProceduralLandmass::IsGenerationProperty(FName PropertyName) const
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, PlateauRampWidth) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, PlateauRampReach) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, PlateauRampStrength) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CliffShelfStrength) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CliffShelfHeightMin) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CliffShelfFrequency) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CliffWallStrength) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CliffShelfFlatness) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, CliffNoiseThreshold) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, bEnableOverhangs) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangHeightMin) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangSlopeMin) ||
@@ -380,14 +378,30 @@ bool AProceduralLandmass::IsGenerationProperty(FName PropertyName) const
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangDepth) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangThickness) ||
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangLipDrop) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangNoiseAmount);
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangNoiseAmount) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, bEnableProceduralCliffActors) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, MaxProceduralCliffActors) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffSpawnChance) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffMinRunPoints) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffMinSpacing) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffMaxLength) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffSurfaceZOffset) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffHeight) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffDepth) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffOverhangAmount) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffMaxTopSlopeDegrees) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffFrontCurveSegments) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffFrontCurveStrength) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffFrontNoiseStrength) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffFrontNoiseScale);
 }
 
 bool AProceduralLandmass::IsMaterialProperty(FName PropertyName) const
 {
     return
         PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, BaseTerrainMaterial) ||
-        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangMaterial);
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, OverhangMaterial) ||
+        PropertyName == GET_MEMBER_NAME_CHECKED(AProceduralLandmass, ProceduralCliffMaterial);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +439,54 @@ float AProceduralLandmass::GetTerrainHeightAtWorldLocation(const FVector& WorldL
 
     const FVector LocalTerrainPoint(LocalLocation.X, LocalLocation.Y, Height01 * HeightMultiplier);
     return GetActorTransform().TransformPosition(LocalTerrainPoint).Z;
+}
+
+float AProceduralLandmass::GetTerrainHeightAtWorldLocationClamped(const FVector& WorldLocation) const
+{
+    const FVector LocalLocation = GetActorTransform().InverseTransformPosition(WorldLocation);
+    const float MaxLocalX = FMath::Max(0, MapWidth - 1) * GridSize;
+    const float MaxLocalY = FMath::Max(0, MapHeight - 1) * GridSize;
+
+    const float ClampedLocalX = FMath::Clamp(LocalLocation.X, 0.0f, MaxLocalX);
+    const float ClampedLocalY = FMath::Clamp(LocalLocation.Y, 0.0f, MaxLocalY);
+
+    float Height01 = 0.0f;
+    if (!SampleHeight01AtLocalXY(ClampedLocalX, ClampedLocalY, Height01))
+    {
+        return GetActorLocation().Z;
+    }
+
+    const FVector LocalTerrainPoint(ClampedLocalX, ClampedLocalY, Height01 * HeightMultiplier);
+    return GetActorTransform().TransformPosition(LocalTerrainPoint).Z;
+}
+
+void AProceduralLandmass::ClearProceduralCliffActors()
+{
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    TArray<AActor*> ActorsToDestroy;
+    for (TActorIterator<AProceduralCliffGenerator> It(World); It; ++It)
+    {
+        AProceduralCliffGenerator* CliffActor = *It;
+        if (CliffActor &&
+            CliffActor->LandmassActor == this &&
+            CliffActor->Tags.Contains(ProceduralGeneratedCliffTag))
+        {
+            ActorsToDestroy.Add(CliffActor);
+        }
+    }
+
+    for (AActor* ActorToDestroy : ActorsToDestroy)
+    {
+#if WITH_EDITOR
+        ActorToDestroy->Modify();
+#endif
+        ActorToDestroy->Destroy();
+    }
 }
 
 bool AProceduralLandmass::SampleHeight01AtLocalXY(float LocalX, float LocalY, float& OutHeight01) const
@@ -677,6 +739,7 @@ void AProceduralLandmass::CreateMesh()
     );
 
     BuildOverhangMesh(Heights, Normals);
+    BuildProceduralCliffActors(Heights, Normals);
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1404,471 @@ void AProceduralLandmass::BuildOverhangMesh(const TArray<float>& Heights, const 
     }
 }
 
+void AProceduralLandmass::BuildProceduralCliffActors(const TArray<float>& Heights, const TArray<FVector>& Normals)
+{
+    ClearProceduralCliffActors();
+
+    UWorld* World = GetWorld();
+    if (!bEnableProceduralCliffActors || !World || MapWidth < 2 || MapHeight < 2 || MaxProceduralCliffActors <= 0)
+    {
+        return;
+    }
+
+    auto GetVertexLocal = [this, &Heights](int32 X, int32 Y) -> FVector
+    {
+        const int32 Index = Y * MapWidth + X;
+        const float Height01 = Heights.IsValidIndex(Index) ? Heights[Index] : 0.0f;
+        return FVector(X * GridSize, Y * GridSize, Height01 * HeightMultiplier);
+    };
+
+    auto GetSlopeMask = [&Normals, this](int32 X, int32 Y) -> float
+    {
+        const int32 Index = Y * MapWidth + X;
+        if (!Normals.IsValidIndex(Index))
+        {
+            return 0.0f;
+        }
+
+        return 1.0f - FMath::Clamp(Normals[Index].Z, 0.0f, 1.0f);
+    };
+
+    auto IsEligibleCliffEdge = [&](int32 AX, int32 AY, int32 BX, int32 BY, float EdgeDrop) -> bool
+    {
+        const int32 IndexA = AY * MapWidth + AX;
+        const int32 IndexB = BY * MapWidth + BX;
+        if (!Heights.IsValidIndex(IndexA) || !Heights.IsValidIndex(IndexB))
+        {
+            return false;
+        }
+
+        const float HeightA = Heights[IndexA];
+        const float HeightB = Heights[IndexB];
+        const float AvgHeight = (HeightA + HeightB) * 0.5f;
+        const float AvgSlope = (GetSlopeMask(AX, AY) + GetSlopeMask(BX, BY)) * 0.5f;
+        return AvgHeight >= OverhangHeightMin && AvgSlope >= OverhangSlopeMin && EdgeDrop >= OverhangCliffDeltaMin;
+    };
+
+    TArray<FBox> OccupiedCliffBounds;
+    int32 SpawnedCliffCount = 0;
+
+    auto TrySpawnCliffActorForRun = [&](const TArray<FVector>& RunPoints, const FVector& OutwardDir, int32 HashSalt) -> bool
+    {
+        if (RunPoints.Num() < FMath::Max(ProceduralCliffMinRunPoints, 2) || SpawnedCliffCount >= MaxProceduralCliffActors)
+        {
+            return false;
+        }
+
+        TArray<FVector> EffectiveRunPoints = RunPoints;
+        float RunLength = 0.0f;
+        for (int32 PointIndex = 1; PointIndex < RunPoints.Num(); ++PointIndex)
+        {
+            RunLength += FVector::Dist2D(RunPoints[PointIndex - 1], RunPoints[PointIndex]);
+        }
+
+        if (RunLength < GridSize * 3.0f)
+        {
+            return false;
+        }
+
+        const float MaxCliffLength = FMath::Max(ProceduralCliffMaxLength, GridSize * 3.0f);
+        if (RunLength > MaxCliffLength)
+        {
+            EffectiveRunPoints.Reset();
+            EffectiveRunPoints.Reserve(RunPoints.Num());
+            EffectiveRunPoints.Add(RunPoints[0]);
+
+            RunLength = 0.0f;
+            for (int32 PointIndex = 1; PointIndex < RunPoints.Num(); ++PointIndex)
+            {
+                const float SegmentLength = FVector::Dist2D(RunPoints[PointIndex - 1], RunPoints[PointIndex]);
+                if (RunLength + SegmentLength > MaxCliffLength)
+                {
+                    const float RemainingLength = FMath::Max(MaxCliffLength - RunLength, 0.0f);
+                    if (RemainingLength > KINDA_SMALL_NUMBER && SegmentLength > KINDA_SMALL_NUMBER)
+                    {
+                        const float SegmentAlpha = RemainingLength / SegmentLength;
+                        EffectiveRunPoints.Add(FMath::Lerp(RunPoints[PointIndex - 1], RunPoints[PointIndex], SegmentAlpha));
+                        RunLength = MaxCliffLength;
+                    }
+                    break;
+                }
+
+                EffectiveRunPoints.Add(RunPoints[PointIndex]);
+                RunLength += SegmentLength;
+            }
+        }
+
+        if (EffectiveRunPoints.Num() < FMath::Max(ProceduralCliffMinRunPoints, 2))
+        {
+            return false;
+        }
+
+        const float SpawnRoll = Hash01(HashSalt + 31, EffectiveRunPoints.Num() + 17, Seed + 1901);
+        if (SpawnRoll > FMath::Clamp(ProceduralCliffSpawnChance, 0.0f, 1.0f))
+        {
+            return false;
+        }
+
+        FBox CandidateBounds(EForceInit::ForceInit);
+        const FVector SafeOutwardDir = OutwardDir.GetSafeNormal();
+        for (const FVector& Point : EffectiveRunPoints)
+        {
+            CandidateBounds += Point;
+            CandidateBounds += Point + SafeOutwardDir * FMath::Max(ProceduralCliffOverhangAmount, ProceduralCliffDepth);
+            CandidateBounds += Point - FVector(0.0f, 0.0f, ProceduralCliffHeight);
+        }
+        CandidateBounds = CandidateBounds.ExpandBy(FVector(ProceduralCliffMinSpacing * 0.5f, ProceduralCliffMinSpacing * 0.5f, ProceduralCliffHeight * 0.15f));
+
+        for (const FBox& ExistingBounds : OccupiedCliffBounds)
+        {
+            if (CandidateBounds.Intersect(ExistingBounds))
+            {
+                return false;
+            }
+        }
+
+        const FVector StartLocal = EffectiveRunPoints[0];
+        const FVector EndLocal = EffectiveRunPoints.Last();
+        const FVector Tangent = FVector(EndLocal.X - StartLocal.X, EndLocal.Y - StartLocal.Y, 0.0f).GetSafeNormal();
+        if (Tangent.IsNearlyZero() || SafeOutwardDir.IsNearlyZero())
+        {
+            return false;
+        }
+
+        const float BaseYawDegrees = FMath::RadiansToDegrees(FMath::Atan2(Tangent.Y, Tangent.X));
+        const float PrototypeEmbedDepth = FMath::Clamp(
+            FMath::Max(ProceduralCliffDepth * 1.5f, ProceduralCliffOverhangAmount * 0.22f),
+            200.0f,
+            700.0f);
+        const float PrototypeMaxEmbedDepth = FMath::Clamp(ProceduralCliffOverhangAmount * 1.6f, 900.0f, 2600.0f);
+        const float OutwardDepth = FMath::Max(ProceduralCliffOverhangAmount, ProceduralCliffDepth);
+        const int32 CoverageSamples = 7;
+        const float RequiredBackCover = 70.0f;
+        const float MaxTopSlopeRadians = FMath::DegreesToRadians(FMath::Clamp(ProceduralCliffMaxTopSlopeDegrees, 0.0f, 45.0f));
+        const float MaxTopSlopePerUnit = FMath::Tan(MaxTopSlopeRadians);
+
+        FRotator BestSpawnRotation(0.0f, BaseYawDegrees, 0.0f);
+        FVector BestSpawnLocal = StartLocal;
+        bool bBestInvertCliffDirection = false;
+        float BestBackEmbedDepth = PrototypeEmbedDepth;
+        float BestCoverageScore = -BIG_NUMBER;
+
+        auto ScoreCandidatePlacement = [&](const FVector& CandidateStartLocal, const FRotator& CandidateRotation, bool& bOutInvertCliffDirection, float& OutBackEmbedDepth) -> float
+        {
+            const FVector ActorLocalY = CandidateRotation.RotateVector(FVector::YAxisVector);
+            bOutInvertCliffDirection = FVector::DotProduct(ActorLocalY, SafeOutwardDir) < 0.0f;
+            const float Direction = bOutInvertCliffDirection ? -1.0f : 1.0f;
+            const FVector CandidateOutwardDir = ActorLocalY * Direction;
+            const float OutwardAlignment = FVector::DotProduct(CandidateOutwardDir.GetSafeNormal(), SafeOutwardDir);
+            if (OutwardAlignment < 0.55f)
+            {
+                return -BIG_NUMBER;
+            }
+
+            const FTransform CandidateWorldTransform(
+                CandidateRotation,
+                GetActorTransform().TransformPosition(CandidateStartLocal),
+                FVector::OneVector);
+
+            const float CenterLocalX = RunLength * 0.5f;
+            const FVector WorldCenterTopSample = CandidateWorldTransform.TransformPosition(FVector(CenterLocalX, 0.0f, 0.0f));
+            const float CenterTopWorldZ = GetTerrainHeightAtWorldLocationClamped(WorldCenterTopSample) + ProceduralCliffSurfaceZOffset;
+            const FVector CenterLocalTopPoint = CandidateWorldTransform.InverseTransformPosition(FVector(WorldCenterTopSample.X, WorldCenterTopSample.Y, CenterTopWorldZ));
+            const float CenterTopLocalZ = CenterLocalTopPoint.Z;
+
+            float BestDepthScore = -BIG_NUMBER;
+            float BestDepth = PrototypeEmbedDepth;
+            for (float Depth = PrototypeEmbedDepth; Depth <= PrototypeMaxEmbedDepth + KINDA_SMALL_NUMBER; Depth += FMath::Max(ProceduralCliffDepth * 0.25f, 50.0f))
+            {
+                float DepthScore = OutwardAlignment * 100.0f;
+                int32 CoveredCount = 0;
+                int32 EndpointCoveredCount = 0;
+                int32 EndpointTotalCount = 0;
+                int32 TotalCount = 0;
+
+                for (int32 XIndex = 0; XIndex < CoverageSamples; ++XIndex)
+                {
+                    const float AlphaX = static_cast<float>(XIndex) / static_cast<float>(CoverageSamples - 1);
+                    const float LocalX = AlphaX * RunLength;
+                    const FVector WorldTopSample = CandidateWorldTransform.TransformPosition(FVector(LocalX, 0.0f, 0.0f));
+                    const float TopWorldZ = GetTerrainHeightAtWorldLocationClamped(WorldTopSample) + ProceduralCliffSurfaceZOffset;
+                    const FVector LocalTopPoint = CandidateWorldTransform.InverseTransformPosition(FVector(WorldTopSample.X, WorldTopSample.Y, TopWorldZ));
+                    const float MaxTopDelta = FMath::Abs(LocalX - CenterLocalX) * MaxTopSlopePerUnit;
+                    const float TopLocalZ = FMath::Clamp(LocalTopPoint.Z, CenterTopLocalZ - MaxTopDelta, CenterTopLocalZ + MaxTopDelta);
+                    const float ApexLocalZ = TopLocalZ - ProceduralCliffHeight;
+
+                    for (int32 ZIndex = 0; ZIndex < CoverageSamples; ++ZIndex)
+                    {
+                        const float AlphaZ = static_cast<float>(ZIndex) / static_cast<float>(CoverageSamples - 1);
+                        const FVector LocalBackSample(LocalX, -Direction * Depth, FMath::Lerp(ApexLocalZ, TopLocalZ, AlphaZ));
+                        const FVector WorldBackSample = CandidateWorldTransform.TransformPosition(LocalBackSample);
+                        const float TerrainZ = GetTerrainHeightAtWorldLocationClamped(WorldBackSample) + ProceduralCliffSurfaceZOffset;
+                        const float CoverAmount = TerrainZ - WorldBackSample.Z;
+
+                        DepthScore += CoverAmount;
+                        DepthScore -= FMath::Square(FMath::Max(RequiredBackCover - CoverAmount, 0.0f)) * 0.08f;
+                        if (CoverAmount >= RequiredBackCover)
+                        {
+                            ++CoveredCount;
+                            if (XIndex == 0 || XIndex == CoverageSamples - 1)
+                            {
+                                ++EndpointCoveredCount;
+                            }
+                        }
+                        if (XIndex == 0 || XIndex == CoverageSamples - 1)
+                        {
+                            ++EndpointTotalCount;
+                        }
+                        ++TotalCount;
+                    }
+                }
+
+                const float CoverageRatio = static_cast<float>(CoveredCount) / FMath::Max(TotalCount, 1);
+                const float EndpointCoverageRatio = static_cast<float>(EndpointCoveredCount) / FMath::Max(EndpointTotalCount, 1);
+                if (CoverageRatio < 0.98f || EndpointCoverageRatio < 1.0f)
+                {
+                    continue;
+                }
+
+                DepthScore += CoverageRatio * 1000.0f;
+                DepthScore += EndpointCoverageRatio * 650.0f;
+                DepthScore -= Depth * 0.05f;
+                if (DepthScore > BestDepthScore)
+                {
+                    BestDepthScore = DepthScore;
+                    BestDepth = Depth;
+                }
+            }
+
+            OutBackEmbedDepth = BestDepth;
+            return BestDepthScore;
+        };
+
+        const float YawOffsets[] = {-35.0f, -20.0f, 0.0f, 20.0f, 35.0f};
+        const float InwardOffsets[] = {0.0f, ProceduralCliffDepth * 0.5f, ProceduralCliffDepth, ProceduralCliffDepth * 1.5f};
+        for (float YawOffset : YawOffsets)
+        {
+            const FRotator CandidateRotation(0.0f, BaseYawDegrees + YawOffset, 0.0f);
+            for (float InwardOffset : InwardOffsets)
+            {
+                const FVector CandidateStartLocal = StartLocal - SafeOutwardDir * InwardOffset;
+                bool bCandidateInvertCliffDirection = false;
+                float CandidateBackEmbedDepth = PrototypeEmbedDepth;
+                const float CandidateScore = ScoreCandidatePlacement(CandidateStartLocal, CandidateRotation, bCandidateInvertCliffDirection, CandidateBackEmbedDepth);
+                if (CandidateScore > BestCoverageScore)
+                {
+                    BestCoverageScore = CandidateScore;
+                    BestSpawnRotation = CandidateRotation;
+                    BestSpawnLocal = CandidateStartLocal;
+                    bBestInvertCliffDirection = bCandidateInvertCliffDirection;
+                    BestBackEmbedDepth = CandidateBackEmbedDepth;
+                }
+            }
+        }
+
+        if (BestCoverageScore <= -BIG_NUMBER * 0.5f)
+        {
+            return false;
+        }
+
+        const FRotator SpawnRotation = BestSpawnRotation;
+        const bool bInvertCliffDirection = bBestInvertCliffDirection;
+        const FVector SpawnLocation = GetActorTransform().TransformPosition(BestSpawnLocal);
+
+        FActorSpawnParameters SpawnParams;
+        SpawnParams.Name = MakeUniqueObjectName(World->GetCurrentLevel(), AProceduralCliffGenerator::StaticClass(), TEXT("GeneratedProceduralCliff"));
+        SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+#if WITH_EDITOR
+        SpawnParams.bHideFromSceneOutliner = false;
+#endif
+
+        AProceduralCliffGenerator* CliffActor = World->SpawnActor<AProceduralCliffGenerator>(
+            AProceduralCliffGenerator::StaticClass(),
+            SpawnLocation,
+            SpawnRotation,
+            SpawnParams);
+        if (!CliffActor)
+        {
+            return false;
+        }
+
+        CliffActor->Tags.AddUnique(ProceduralGeneratedCliffTag);
+        CliffActor->LandmassActor = this;
+        CliffActor->CliffLength = RunLength;
+        CliffActor->CliffHeight = ProceduralCliffHeight;
+        CliffActor->CliffDepth = ProceduralCliffDepth;
+        CliffActor->LandmassSurfaceZOffset = ProceduralCliffSurfaceZOffset;
+        CliffActor->bClampSamplesToLandmassBounds = true;
+        CliffActor->bSnapTopEdgeToLandmass = true;
+        CliffActor->bSampleStitchEdgesFromLandmass = true;
+        CliffActor->bUseActorZAsMinimumTopHeight = false;
+        CliffActor->bUseActorZAsMinimumStitchHeight = false;
+        CliffActor->bAnchorTopHeightAtAttachEdge = true;
+        CliffActor->TopStitchDepth = FMath::Clamp(ProceduralCliffDepth * 0.72f, 80.0f, 280.0f);
+        CliffActor->BottomStitchDepth = FMath::Clamp(ProceduralCliffDepth * 0.48f, 60.0f, 220.0f);
+        CliffActor->EndStitchDepth = FMath::Clamp(ProceduralCliffDepth * 0.48f, 60.0f, 220.0f);
+        CliffActor->bCreateEndStitchStrips = true;
+        CliffActor->bCreateBackStitchWall = true;
+        CliffActor->bInvertCliffDirection = bInvertCliffDirection;
+        CliffActor->bDoubleSidedGeometry = true;
+        CliffActor->bUsePyramidPrototype = true;
+        CliffActor->PrototypeBackFaceEmbedDepth = BestBackEmbedDepth;
+        CliffActor->bAutoFitPrototypeBackFaceToLandmass = false;
+        CliffActor->PrototypeBackFaceBurialMargin = 35.0f;
+        CliffActor->PrototypeBackFaceFitSamples = 5;
+        CliffActor->PrototypeMaxAutoEmbedDepth = FMath::Clamp(ProceduralCliffOverhangAmount * 1.6f, 900.0f, 2600.0f);
+        CliffActor->PrototypeStripSegments = 4;
+        CliffActor->PrototypeEndTaper = 0.22f;
+        CliffActor->PrototypeWidthNoise = 0.12f;
+        CliffActor->PrototypeMaxTopSlopeDegrees = ProceduralCliffMaxTopSlopeDegrees;
+        CliffActor->PrototypeFrontCurveSegments = ProceduralCliffFrontCurveSegments;
+        CliffActor->PrototypeFrontCurveStrength = ProceduralCliffFrontCurveStrength;
+        CliffActor->PrototypeFrontNoiseStrength = ProceduralCliffFrontNoiseStrength;
+        CliffActor->PrototypeFrontNoiseScale = ProceduralCliffFrontNoiseScale;
+        CliffActor->bUseDebugSectionColors = true;
+        CliffActor->bUseSimplifiedDebugGeometry = true;
+        CliffActor->DebugHorizontalSegments = 8;
+        CliffActor->DebugVerticalSegments = 4;
+        CliffActor->HorizontalSegments = FMath::Clamp(FMath::RoundToInt(RunLength / FMath::Max(GridSize, 1.0f)), 8, 48);
+        CliffActor->VerticalSegments = 24;
+        CliffActor->NoiseScale = FMath::Max(GridSize * 4.5f, 180.0f);
+        CliffActor->NoiseStrength = FMath::Max(ProceduralCliffDepth * 0.55f, 65.0f);
+        CliffActor->LedgeFrequency = 5.5f;
+        CliffActor->LedgeStrength = 2.0f;
+        CliffActor->OverhangAmount = ProceduralCliffOverhangAmount;
+        CliffActor->OverhangStartAlpha = 0.62f;
+        CliffActor->UndercutStrength = 0.82f;
+        CliffActor->TopLipStrength = 0.92f;
+        CliffActor->EndTaperFraction = 0.3f;
+        CliffActor->CliffMaterial = ProceduralCliffMaterial ? ProceduralCliffMaterial : (OverhangMaterial ? OverhangMaterial : BaseTerrainMaterial);
+        CliffActor->GenerateCliff();
+
+#if WITH_EDITOR
+        CliffActor->SetActorLabel(FString::Printf(TEXT("ProceduralCliff_Generated_%02d"), SpawnedCliffCount + 1));
+        CliffActor->SetFolderPath(GetFolderPath());
+        CliffActor->MarkPackageDirty();
+#endif
+
+        OccupiedCliffBounds.Add(CandidateBounds);
+        ++SpawnedCliffCount;
+        return true;
+    };
+
+    const float HeightDeltaThreshold = OverhangCliffDeltaMin;
+
+    for (int32 X = 0; X < MapWidth - 1 && SpawnedCliffCount < MaxProceduralCliffActors; ++X)
+    {
+        int32 Y = 0;
+        while (Y < MapHeight - 1 && SpawnedCliffCount < MaxProceduralCliffActors)
+        {
+            const int32 Index = Y * MapWidth + X;
+            const float LeftHeight = Heights.IsValidIndex(Index) ? Heights[Index] : 0.0f;
+            const float RightHeight = Heights.IsValidIndex(Index + 1) ? Heights[Index + 1] : LeftHeight;
+            const bool bLeftHigh = LeftHeight - RightHeight > HeightDeltaThreshold;
+            const bool bRightHigh = RightHeight - LeftHeight > HeightDeltaThreshold;
+
+            if (!bLeftHigh && !bRightHigh)
+            {
+                ++Y;
+                continue;
+            }
+
+            const bool bHighSideIsLeft = bLeftHigh;
+            const FVector OutwardDir = bHighSideIsLeft ? FVector(1.0f, 0.0f, 0.0f) : FVector(-1.0f, 0.0f, 0.0f);
+            const int32 RunStartY = Y;
+            TArray<FVector> RunPoints;
+
+            while (Y < MapHeight - 1)
+            {
+                const int32 RunIndex = Y * MapWidth + X;
+                const float RunLeft = Heights.IsValidIndex(RunIndex) ? Heights[RunIndex] : 0.0f;
+                const float RunRight = Heights.IsValidIndex(RunIndex + 1) ? Heights[RunIndex + 1] : RunLeft;
+                const float RunDrop = bHighSideIsLeft ? (RunLeft - RunRight) : (RunRight - RunLeft);
+                const bool bStillMatches = bHighSideIsLeft
+                    ? (RunLeft - RunRight > HeightDeltaThreshold)
+                    : (RunRight - RunLeft > HeightDeltaThreshold);
+                const int32 AX = bHighSideIsLeft ? X : X + 1;
+                const int32 BX = AX;
+                const int32 AY = Y;
+                const int32 BY = Y + 1;
+
+                if (!bStillMatches || !IsEligibleCliffEdge(AX, AY, BX, BY, RunDrop))
+                {
+                    break;
+                }
+
+                if (RunPoints.Num() == 0)
+                {
+                    RunPoints.Add(GetVertexLocal(AX, AY));
+                }
+                RunPoints.Add(GetVertexLocal(BX, BY));
+                ++Y;
+            }
+
+            if (!TrySpawnCliffActorForRun(RunPoints, OutwardDir, 3001 + X * 17 + RunStartY) && RunPoints.Num() == 0)
+            {
+                ++Y;
+            }
+        }
+    }
+
+    for (int32 Y = 0; Y < MapHeight - 1 && SpawnedCliffCount < MaxProceduralCliffActors; ++Y)
+    {
+        int32 X = 0;
+        while (X < MapWidth - 1 && SpawnedCliffCount < MaxProceduralCliffActors)
+        {
+            const int32 Index = Y * MapWidth + X;
+            const float BottomHeight = Heights.IsValidIndex(Index) ? Heights[Index] : 0.0f;
+            const float TopHeight = Heights.IsValidIndex(Index + MapWidth) ? Heights[Index + MapWidth] : BottomHeight;
+            const bool bBottomHigh = BottomHeight - TopHeight > HeightDeltaThreshold;
+            const bool bTopHigh = TopHeight - BottomHeight > HeightDeltaThreshold;
+
+            if (!bBottomHigh && !bTopHigh)
+            {
+                ++X;
+                continue;
+            }
+
+            const bool bHighSideIsBottom = bBottomHigh;
+            const FVector OutwardDir = bHighSideIsBottom ? FVector(0.0f, 1.0f, 0.0f) : FVector(0.0f, -1.0f, 0.0f);
+            const int32 RunStartX = X;
+            TArray<FVector> RunPoints;
+
+            while (X < MapWidth - 1)
+            {
+                const int32 RunIndex = Y * MapWidth + X;
+                const float RunBottom = Heights.IsValidIndex(RunIndex) ? Heights[RunIndex] : 0.0f;
+                const float RunTop = Heights.IsValidIndex(RunIndex + MapWidth) ? Heights[RunIndex + MapWidth] : RunBottom;
+                const float RunDrop = bHighSideIsBottom ? (RunBottom - RunTop) : (RunTop - RunBottom);
+                const bool bStillMatches = bHighSideIsBottom
+                    ? (RunBottom - RunTop > HeightDeltaThreshold)
+                    : (RunTop - RunBottom > HeightDeltaThreshold);
+                const int32 AY = bHighSideIsBottom ? Y : Y + 1;
+                const int32 BY = AY;
+                const int32 AX = X + 1;
+                const int32 BX = X;
+
+                if (!bStillMatches || !IsEligibleCliffEdge(AX, AY, BX, BY, RunDrop))
+                {
+                    break;
+                }
+
+                if (RunPoints.Num() == 0)
+                {
+                    RunPoints.Add(GetVertexLocal(BX, BY));
+                }
+                RunPoints.Add(GetVertexLocal(AX, AY));
+                ++X;
+            }
+
+            if (!TrySpawnCliffActorForRun(RunPoints, OutwardDir, 4001 + RunStartX * 17 + Y) && RunPoints.Num() == 0)
+            {
+                ++X;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Heightmap Generation
 // ---------------------------------------------------------------------------
@@ -1583,50 +2111,6 @@ void AProceduralLandmass::BuildHeightMap(TArray<float>& OutHeights) const
                             CapPreserveMask * FlattenStrength);
                     }
                 }
-            }
-
-            // Heightfield-safe cliff shelf shaping for high rocky regions.
-            if (CliffShelfStrength > 0.0f && CliffShelfFrequency > 0.0f)
-            {
-                const float ShelfNoise = ComputeRidgedNoise(
-                    SampleX * 1.9f,
-                    SampleY * 1.9f,
-                    3,
-                    0.6f,
-                    2.15f,
-                    1.8f);
-                const float CliffMicroNoise = ComputeRidgedNoise(
-                    SampleX * 3.1f,
-                    SampleY * 3.1f,
-                    2,
-                    0.55f,
-                    2.0f,
-                    1.5f);
-                const float HighCliffMask =
-                    FMath::SmoothStep(CliffShelfHeightMin, 1.0f, FinalHeight) *
-                    FMath::SmoothStep(0.5f, 0.82f, RidgeNoise) *
-                    FMath::SmoothStep(CliffNoiseThreshold, 0.82f, ShelfNoise) *
-                    FMath::SmoothStep(0.35f, 0.7f, CliffMicroNoise);
-
-                const float ShelfStep = 1.0f / CliffShelfFrequency;
-                const float ShelfIndex = FMath::FloorToFloat(FinalHeight / ShelfStep);
-                const float ShelfBase = ShelfIndex * ShelfStep;
-                const float ShelfFraction = (ShelfStep > KINDA_SMALL_NUMBER)
-                    ? (FinalHeight - ShelfBase) / ShelfStep
-                    : 0.0f;
-
-                const float Flatness = FMath::Clamp(CliffShelfFlatness, 0.05f, 0.8f);
-                const float ShelfTopMask = FMath::SmoothStep(0.0f, Flatness, ShelfFraction);
-                const float ShelfTopHeight = ShelfBase + ShelfStep * Flatness * 0.55f;
-                const float ShelfLedgeHeight = ShelfBase + ShelfStep * 0.18f;
-
-                // Lower part of each band becomes a flatter ledge; upper part becomes a steeper wall.
-                const float ShelfTarget = FMath::Lerp(ShelfLedgeHeight, FinalHeight, ShelfTopMask);
-                const float WallTarget = FMath::Lerp(FinalHeight, ShelfBase + ShelfStep * 0.96f, FMath::Pow(FMath::Clamp(ShelfFraction, 0.0f, 1.0f), 0.55f));
-
-                FinalHeight = FMath::Lerp(FinalHeight, ShelfTarget, HighCliffMask * CliffShelfStrength);
-                FinalHeight = FMath::Lerp(FinalHeight, WallTarget, HighCliffMask * CliffWallStrength);
-                FinalHeight = FMath::Clamp(FinalHeight, 0.0f, 1.0f);
             }
 
             // Shoreline pass. This acts like a lightweight tidal erosion layer:

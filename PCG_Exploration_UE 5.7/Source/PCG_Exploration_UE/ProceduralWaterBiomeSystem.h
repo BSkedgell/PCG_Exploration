@@ -342,6 +342,7 @@ private:
     EWaterSplineFitShape GetWaterActorFitShape(AActor* WaterActor) const;
     USplineComponent* FindEditableWaterSpline(AActor* WaterActor) const;
     void InvalidateWaterQueryCache() const;
+    void InvalidateLakeSplineQueryCache() const;
     void RebuildLakeSplineQueryCache() const;
     void DrawDebugBiomeGrid() const;
     bool IsInsideLandmassXY(const FVector& WorldLocation) const;
